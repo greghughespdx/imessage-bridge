@@ -18,8 +18,27 @@ The bridge runs as a background service on your Mac. Any client on your network 
 ## Requirements
 
 - macOS with iMessage signed in
-- Full Disk Access for Terminal (System Settings > Privacy & Security > Full Disk Access)
-- Python 3 (ships with macOS)
+- Python 3 (ships with macOS since Catalina)
+
+## Permissions
+
+macOS requires two one-time permissions. Both trigger automatically as system prompts the first time they're needed.
+
+**1. Full Disk Access (required before reading messages)**
+
+The bridge needs to read `~/Library/Messages/chat.db`. macOS blocks this unless the process has Full Disk Access.
+
+Go to **System Settings > Privacy & Security > Full Disk Access** and add **Terminal** (or whatever terminal app you use). Click the **+** button and navigate to `/Applications/Utilities/Terminal.app`.
+
+If you skip this step, the bridge will start but return empty results for all message queries. There is no error message. It just silently returns nothing.
+
+**2. Automation permission (required before sending messages)**
+
+The first time the bridge sends a message via AppleScript, macOS will show a prompt: "Python wants to control Messages.app." Click **Allow**.
+
+If you skip this or click Deny, sends will fail with an AppleScript error. You can re-enable it in **System Settings > Privacy & Security > Automation**.
+
+After granting both permissions, the bridge works without further prompts.
 
 ## Install
 
