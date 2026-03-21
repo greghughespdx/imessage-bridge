@@ -2,7 +2,7 @@
 
 Send and receive iMessages from anything that speaks HTTP. Zero dependencies, no middleware, no private APIs.
 
-## iMessage conversation with your AI agent
+## iMessage conversations with your Claude Code agent
 
 **imessage-bridge** enables programmatic access to send/receive messages via iMessage on macOS. It reads directly from the Messages app database and sends outbound messages via AppleScript. No third-party middleware, no hooking into private APIs and frameworks, no SIP hacks. It leverages the stable public interfaces that Apple has allowed and supported for more than a decade.
 
