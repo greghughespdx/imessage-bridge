@@ -4,31 +4,31 @@ Send and receive iMessages from anything that speaks HTTP. Zero dependencies, no
 
 ## iMessage conversations with your Claude Code agent
 
-**imessage-bridge** enables programmatic access to send/receive messages via iMessage on macOS. It reads directly from the Messages app database and sends outbound messages via AppleScript. No third-party middleware, no hooking into private APIs and frameworks, no SIP hacks. It leverages the stable public interfaces that Apple has allowed and supported for more than a decade.
+**imessage-bridge** enables agents to send/receive messages via iMessage on macOS. It reads directly from the Messages.app database and sends outbound messages via AppleScript. No third-party middleware, no hooking into private APIs and frameworks, no SIP hacks. It leverages the stable public interfaces that Apple has allowed and supported for more than a decade.
 
-While this package was designed to be used with [Claude Code's new (as of mid-March 2026) Channels](https://code.claude.com/docs/en/channels) feature to enable Claude AI assistants to send and receive iMessages, the HTTP API works with anything that speaks the protocol: scripts, bots, home automation, and - of course - other AI tools and agents.
+While this package was designed to be used with [Claude Code's new (as of mid-March 2026) Channels](https://code.claude.com/docs/en/channels) feature to enable Claude AI assistants to send and receive iMessages, the HTTP API also works with anything that speaks the protocol: scripts, bots, home automation, and - of course - other AI tools and agents.
 
-If you want to have a conversation with your agent when you're on CarPlay, iMessage is your option. Otherwise, you're pretty much stuck with listen-only mode and unable to send Siri-dictated messages. And by the way: It's completey unsafe to hold your phone and use it while you drive. Use the hands-free voice assistant, and pay 100% attention to the road and your surroundings.
+If you want to have a conversation with your agent when you're on CarPlay, iMessage is your best option. Otherwise, you're pretty much stuck with listen-only mode and unable to send Siri-dictated messages. And by the way: It's completely unsafe to hold your phone and use it while you drive. Use the hands-free voice assistant, and pay 100% attention to the road and your surroundings.
 
-This system can send and receive text-based messages via iMessage (blue) and SMS if configured (green). attachments/RCS/MMS are not supported. 
+This system can send and receive text-based messages via iMessage (blue) and SMS if configured (green). Attachments/RCS/MMS are not supported. 
 
 ## Two components
 
 This project has two components. You'll install component one or both, depending on your setup and needs:
 
-**The bridge** (`bridge.py`) is a lightweight HTTP server that runs on a Mac where the Apple Messages app installed and signed in with the user account you want the AI agent to use. It reads the Messages database and sends messages via AppleScript. One-to-many clients (agents, etc.) on your network can connect to it. Think of it as a local HTTP API for iMessage. It's ~200 lines of Python with zero dependencies beyond the standard Python3 library.
+**The bridge** (`bridge.py`) is a lightweight HTTP server that runs on a Mac where the Apple Messages app is installed and signed in with the user account you want the AI agent to use. It reads the Messages database and sends messages via AppleScript. One-to-many clients (agents, etc.) on your network can connect to it. Think of it as a local HTTP API for iMessage. It's ~200 lines of Python with zero dependencies beyond the standard Python3 library.
 
 **The channel server** (`channel-server.ts`) is a Claude Code Channels plugin that connects the Messages app to a Claude Code session. Messages arrive as native Channel events, just like Telegram or Slack. It can either read the Messages app database directly (if Claude Code is on the same Mac as the Messages app being used) or connect to a remote bridge (as described above).
 
 ## Which component(s) do I need?
 
-**If Claude Code and iMessage are on the same Mac,** you only need the channel server. It reads the Messages app database directly and sends via AppleScript. No bridge, no HTTP, no network. This is the simplest setup. Quick, fast and simple.
+**If Claude Code and iMessage are on the same Mac,** you only need the channel server. It reads the Messages app database directly and sends via AppleScript. No bridge, no HTTP, no network. This is the simplest setup. Quick, fast, and simple.
 
 **If Claude Code and iMessage are on different Macs,** you need both components. Install the bridge on the Mac with the Messages app you want the agent to send/receive from. Install the channel server on the Mac with Claude Code installed. The channel server will discover the bridge(s) automatically via Bonjour, or you can configure it manually to connect to a specific bridge URL.
 
 **If you want multiple Claude Code instances (or other clients) to access one iMessage account,** install the bridge on the Mac with the signed-in Messages app. Each client can connect to the same bridge. The bridge is your multi-client story: one system "bridging" iMessage to any number of consumers.
 
-**If you want the HTTP API on the same Mac as Claude Code** (for example, to let other machines connect too), just install both components on the same Mac. You only need to do this if you need to connect a remote client(s) to a Messages app running on the same Mac as you Claude Code instance.
+**If you want the HTTP API on the same Mac as Claude Code** (for example, to let other machines connect too), just install both components on the same Mac. You only need to do this if you need to connect a remote client(s) to a Messages app running on the same Mac as your Claude Code instance.
 
 | Setup | Install | How it connects |
 |-------|---------|-----------------|
@@ -70,17 +70,17 @@ If you click Deny or dismiss the prompt, message sends will fail with an AppleSc
 brew services restart imessage-bridge
 ```
 
-## Identity: which iMessage account does the agent use?
+## Identity: Which iMessage account does the agent use?
 
 This is important to understand before installing: The bridge sends and receives messages as whichever Apple ID is signed into the Messages app on the Mac where the bridge runs. If you want your AI agent to have its own iMessage identity (i.e., separate from your personal one), sign into the agent's Apple ID in Messages.app on the Mac running the bridge.
 
-For example: You are looged into your personal iMessage account on your laptop. You set up a second Mac (or a Mac mini) which is signed into a different Apple ID for the agent. You would install the bridge on the Mac where the agent's iMessage account is logged in. The agent can then send/receive messages using it's own assigned identity. Your contacts will see messages from the agent's name and email/number, and replies will go back to the agent as well.
+For example: You are logged into your personal iMessage account on your laptop. You set up a second Mac (or a Mac mini) which is signed into a different Apple ID for the agent. You would install the bridge on the Mac where the agent's iMessage account is logged in. The agent can then send/receive messages using its own assigned identity. Your contacts will see messages from the agent's name and email/number, and replies will go back to the agent as well.
 
 If you run the bridge on a Mac signed into your personal iMessage, the agent with sends as you and can have access to all of your received messages. You may want that or decide it's fine for your use case, but be aware of it.
 
 ## SMS (green bubble) support
 
-The bridge handles both iMessage (blue bubble) and SMS/MMS (green bubble) messages through the same interface. The messages you can send sitting at the Mac's keyboard are the same ones the agent can send. Both end up in chat.db and both can be sent via the same AppleScript commands.
+The bridge handles both iMessage (blue bubble) and SMS/MMS (green bubble) messages through the same interface. The messages you can send sitting at the Mac's keyboard are the same ones the agent can send. Both end up in chat.db, and both can be sent via the same AppleScript commands.
 
 ***Note:*** For SMS relay to work, you need **Text Message Forwarding** enabled on your iPhone: Settings > Messages > Text Message Forwarding, and enable it for the Mac running the bridge. This is a standard Apple feature. 
 
@@ -137,7 +137,7 @@ The channel server automatically detects the best connection mode at startup:
 2. If chat.db is accessible locally, it reads directly (no bridge needed).
 3. If neither works, it searches for a bridge on the local network via Bonjour.
 
-**Important:** If you have iMessage signed in on the same Mac as Claude Code AND you want the agent to use a different iMessage account on another Mac, you must set `IMESSAGE_BRIDGE_URL` explicitly. Otherwise the channel server will find the local chat.db first and use your personal account instead of the remote bridge. Set it in your `.mcp.json`:
+**Important:** If you have iMessage signed in on the same Mac as Claude Code AND you want the agent to use a different iMessage account on another Mac, you must set `IMESSAGE_BRIDGE_URL` explicitly. Otherwise, the channel server will find the local chat.db first and use your personal account instead of the remote bridge. Set it in your `.mcp.json`:
 
 ```json
 {
@@ -241,7 +241,7 @@ All data stays on your local network: No cloud services, no third-party servers,
 
 There are other apps available, which hook into Apple's private frameworks (IMCore, IMFoundation) to intercept messages at the process level. This requires SIP modifications on newer macOS versions, is dependent on undocumented APIs that Apple actively locks down, and in some cases can destabilize the Messages app itself.
 
-imessage-bridge takes a different approach: It is small, lightweight and does two things: send and receive text-based messages. It reads the Messages database (a plain SQLite file stored on disk) and sends using AppleScript (Apple's official automation interface). These are public, documented, stable interfaces. Third-party tools have read chat.db for over a decade, and AppleScript automation for Messages has been supported since OS X Mountain Lion.
+imessage-bridge takes a different approach: It is small, lightweight, and does two things: send and receive text-based messages. It reads the Messages database (a plain SQLite file stored on disk) and sends using AppleScript (Apple's official automation interface). These are public, documented, stable interfaces. Third-party tools have read chat.db for over a decade, and AppleScript automation for Messages has been supported since OS X Mountain Lion.
 
 The tradeoff is scope. The bigger, heavier apps can do things we can't: read receipts, typing activity indicators, attachment downloads via private API, group chat management, etc. For reading and sending text messages, imessage-bridge is simpler, stable, and requires no modifications to your system other than the one-time permissions grant.
 
