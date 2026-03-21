@@ -6,11 +6,11 @@ Send and receive iMessages from anything that speaks HTTP. Zero dependencies, no
 
 **imessage-bridge** enables agents to send/receive messages via iMessage on macOS. It reads directly from the Messages.app database and sends outbound messages via AppleScript. No third-party middleware, no hooking into private APIs and frameworks, no SIP hacks. It leverages the stable public interfaces that Apple has allowed and supported for more than a decade.
 
-While this package was designed to be used with [Claude Code's new (as of mid-March 2026) Channels](https://code.claude.com/docs/en/channels) feature to enable Claude AI assistants to send and receive iMessages, the HTTP API also works with anything that speaks the protocol: scripts, bots, home automation, and - of course - other AI tools and agents. Group chats are supported, too.
+While this package was designed to be used with [Claude Code's new (as of mid-March 2026) Channels](https://code.claude.com/docs/en/channels) feature to enable Claude AI assistants to send and receive iMessages, the HTTP API also works with anything that speaks the protocol: scripts, bots, home automation, and - of course - other AI tools and agents. 
 
-Side note: If you want to have a conversation with your agent when you're on CarPlay, iMessage is your best option. Otherwise, you're pretty much stuck with listen-only mode and unable to send Siri-dictated messages. And by the way: It's completely unsafe to hold your phone and use it while you drive. Use the hands-free voice assistant, and pay 100% attention to the road and your surroundings.
+This system can send and receive text-based messages via iMessage (blue) and SMS if configured (green). Group chats are supported, too. Attachments/RCS/MMS are not supported.
 
-This system can send and receive text-based messages via iMessage (blue) and SMS if configured (green). Attachments/RCS/MMS are not supported. 
+Side note: If you want to have a conversation with your agent when you're on CarPlay, iMessage is your best option. Otherwise, you're pretty much stuck with listen-only mode and unable to send Siri-dictated messages. Use the hands-free voice assistant, and pay 100% attention to the road and your surroundings. 
 
 ## Two components
 
