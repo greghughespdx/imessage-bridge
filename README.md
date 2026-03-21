@@ -8,7 +8,7 @@ Send and receive iMessages from anything that speaks HTTP. Zero dependencies, no
 
 While this package was designed to be used with [Claude Code's new (as of mid-March 2026) Channels](https://code.claude.com/docs/en/channels) feature to enable Claude AI assistants to send and receive iMessages, the HTTP API also works with anything that speaks the protocol: scripts, bots, home automation, and - of course - other AI tools and agents.
 
-If you want to have a conversation with your agent when you're on CarPlay, iMessage is your best option. Otherwise, you're pretty much stuck with listen-only mode and unable to send Siri-dictated messages. And by the way: It's completely unsafe to hold your phone and use it while you drive. Use the hands-free voice assistant, and pay 100% attention to the road and your surroundings.
+Side note: If you want to have a conversation with your agent when you're on CarPlay, iMessage is your best option. Otherwise, you're pretty much stuck with listen-only mode and unable to send Siri-dictated messages. And by the way: It's completely unsafe to hold your phone and use it while you drive. Use the hands-free voice assistant, and pay 100% attention to the road and your surroundings.
 
 This system can send and receive text-based messages via iMessage (blue) and SMS if configured (green). Attachments/RCS/MMS are not supported. 
 
