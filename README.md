@@ -129,6 +129,8 @@ Register it in your project's `.mcp.json`:
 }
 ```
 
+**Once the channel server is loaded, iMessages arrive in your Claude Code session as channel events, and Claude has a built-in reply tool to respond.** There is no HTTP to write, no API to call. Inbound messages appear automatically, and Claude replies using the `reply` tool with the `chat_id` from the message. It works the same way as the Telegram and Discord channel plugins.
+
 The channel server automatically detects the best connection mode at startup:
 
 1. If `IMESSAGE_BRIDGE_URL` is set, it connects to that bridge directly.
