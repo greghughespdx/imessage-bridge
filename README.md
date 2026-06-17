@@ -190,6 +190,14 @@ Content-Type: application/json
 
 Returns `{"status": "sent"}` on success. The `chat_id` is the iMessage chat GUID. You can find it in the `chat_guid` field of received messages.
 
+**Warm Messages.app without sending a visible message:**
+
+```
+POST /warmup
+```
+
+Returns `{"status": "warmed"}` on success. This performs a non-visible AppleScript health/warm-up operation so clients can prime Messages.app before a real send.
+
 **Bridge info:**
 
 ```
@@ -285,4 +293,3 @@ The channel server polls every 1 second by default. If messages seem delayed, ch
 ## License
 
 MIT. See LICENSE.
-

@@ -133,6 +133,20 @@ def send_message(chat_id: str, text: str) -> None:
         )
 
 
+def warmup_messages() -> None:
+    """Prime Messages.app through a non-visible AppleScript operation."""
+    result = subprocess.run(
+        ["osascript", "-e", 'tell application "Messages" to count chats'],
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"AppleScript warmup failed (exit {result.returncode}): {result.stderr.strip()}"
+        )
+
+
 class BridgeHandler(BaseHTTPRequestHandler):
     """HTTP request handler for the iMessage bridge."""
 
@@ -185,6 +199,17 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+
+        if parsed.path == "/warmup":
+            try:
+                warmup_messages()
+            except RuntimeError as e:
+                print(f"[bridge] ERROR warming Messages: {e}", file=sys.stderr)
+                self.send_error_json(500, str(e))
+                return
+
+            self.send_json(200, {"status": "warmed"})
+            return
 
         if parsed.path != "/send":
             self.send_error_json(404, "Not found")
