@@ -203,7 +203,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if parsed.path == "/warmup":
             try:
                 warmup_messages()
-            except RuntimeError as e:
+            except Exception as e:
                 print(f"[bridge] ERROR warming Messages: {e}", file=sys.stderr)
                 self.send_error_json(500, str(e))
                 return
