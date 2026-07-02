@@ -106,6 +106,27 @@ describe('sendRemoteWithKeepalive', () => {
     expect(calls[1].url).toBe('http://bridge.local:8432/send')
   })
 
+  test('drains the keepalive response before sending', async () => {
+    let drained = false
+    const { fetchImpl } = makeFetch(call => {
+      if (call.url.endsWith('/info')) {
+        const res = new Response('bridge diagnostic body', { status: 404 })
+        res.arrayBuffer = async () => {
+          drained = true
+          return new TextEncoder().encode('bridge diagnostic body').buffer
+        }
+        return res
+      }
+      expect(drained).toBe(true)
+      return new Response('{"status":"sent"}', { status: 200 })
+    })
+
+    await sendRemoteWithKeepalive('http://bridge.local:8432', 'chat-id', 'hello', {
+      fetchImpl,
+      retryDelayMs: 0,
+    })
+  })
+
   test('reports the final bridge response when all send attempts fail', async () => {
     const { fetchImpl } = makeFetch(call => {
       if (call.url.endsWith('/info')) return new Response('{}', { status: 200 })

@@ -49,10 +49,11 @@ export async function probeRemoteBridge(
   // Any HTTP response proves the TCP/HTTP path is alive. Older bridges or
   // future deployments may not make /info authoritative for send readiness, so
   // keep this probe about connection freshness rather than policy.
-  await fetchImpl(
+  const res = await fetchImpl(
     bridgeEndpoint(bridgeUrl, '/info'),
     requestInit({ headers: { Accept: 'application/json' } }, timeoutMs),
   )
+  await res.arrayBuffer().catch(() => undefined)
 }
 
 export async function postRemoteMessage(
