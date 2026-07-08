@@ -336,6 +336,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         try:
             elapsed = send_message(chat_id, str(text))
         except subprocess.TimeoutExpired:
+            with _SEND_STATS_LOCK:
+                SEND_STATS["failed"] += 1
+                SEND_STATS["last_error"] = "osascript timeout after 60s"
             log.error("send TIMEOUT chat=%s (osascript >60s)", chat_id)
             self.send_error_json(500, "AppleScript timed out after 60s")
             return
