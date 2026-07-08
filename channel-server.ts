@@ -24,6 +24,7 @@ import {
 import { Database } from 'bun:sqlite'
 import * as os from 'os'
 import * as path from 'path'
+import { sendRemoteWithKeepalive } from './remote-send'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -322,16 +323,9 @@ async function sendRemote(
   chatId: string,
   text: string,
 ): Promise<void> {
-  const res = await fetch(`${bridgeUrl}/send`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text }),
+  await sendRemoteWithKeepalive(bridgeUrl, chatId, text, {
+    log: message => process.stderr.write(`imessage: ${message}\n`),
   })
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => '(no body)')
-    throw new Error(`bridge returned ${res.status}: ${body}`)
-  }
 }
 
 // ---------------------------------------------------------------------------

@@ -9,6 +9,8 @@ Usage:
 
 import argparse
 import json
+import logging
+import logging.handlers
 import os
 import platform
 import socket
@@ -16,8 +18,41 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+
+# mc-lkbx diagnostics: timestamped, rotating application log. launchd's
+# StandardOut/ErrorPath stays as crash-output-of-last-resort only; routine
+# lines go here with rotation so the log can never grow unbounded again
+# (the previous stderr-only log reached 792MB).
+LOG_PATH = os.environ.get(
+    "IMESSAGE_BRIDGE_LOG", "/usr/local/var/log/imessage-bridge-app.log"
+)
+log = logging.getLogger("bridge")
+
+
+def setup_logging() -> None:
+    log.setLevel(logging.INFO)
+    fmt = logging.Formatter(
+        "%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%dT%H:%M:%S%z"
+    )
+    try:
+        fh = logging.handlers.RotatingFileHandler(
+            LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=5
+        )
+        fh.setFormatter(fmt)
+        log.addHandler(fh)
+    except OSError as e:
+        print(f"[bridge] WARNING: cannot open log file {LOG_PATH}: {e}", file=sys.stderr)
+    sh = logging.StreamHandler(sys.stderr)
+    sh.setFormatter(fmt)
+    log.addHandler(sh)
+
+
+BRIDGE_STARTED_AT = time.time()
+SEND_STATS = {"sent": 0, "failed": 0, "last_send_at": None, "last_error": None}
+_SEND_STATS_LOCK = threading.Lock()
 
 # Apple epoch is seconds since 2001-01-01 00:00:00 UTC
 # Unix epoch is seconds since 1970-01-01 00:00:00 UTC
@@ -108,10 +143,12 @@ def get_messages(db_path: str, after_unix_ms: int) -> list:
     return messages
 
 
-def send_message(chat_id: str, text: str) -> None:
+def send_message(chat_id: str, text: str) -> float:
     """
     Send an iMessage via AppleScript.
     chat_id should be a full chat GUID like 'iMessage;-;+15034102254'.
+    Returns the AppleScript elapsed time in seconds. Logs per-send timing and
+    the osascript exit/stderr detail (mc-lkbx diagnostics).
     """
     escaped_text = escape_applescript_string(text)
     escaped_chat_id = escape_applescript_string(chat_id)
@@ -121,16 +158,69 @@ def send_message(chat_id: str, text: str) -> None:
         f'to chat id "{escaped_chat_id}"'
     )
 
+    t0 = time.monotonic()
     result = subprocess.run(
         ["osascript", "-e", script],
         capture_output=True,
         text=True,
+        timeout=60,
     )
+    elapsed = time.monotonic() - t0
 
     if result.returncode != 0:
+        with _SEND_STATS_LOCK:
+            SEND_STATS["failed"] += 1
+            SEND_STATS["last_error"] = result.stderr.strip()[:300]
+        log.error(
+            "send FAILED chat=%s elapsed=%.2fs osascript_exit=%d stderr=%s",
+            chat_id, elapsed, result.returncode, result.stderr.strip()[:300],
+        )
         raise RuntimeError(
             f"AppleScript failed (exit {result.returncode}): {result.stderr.strip()}"
         )
+
+    with _SEND_STATS_LOCK:
+        SEND_STATS["sent"] += 1
+        SEND_STATS["last_send_at"] = time.time()
+    log.info("send ok chat=%s elapsed=%.2fs text_len=%d", chat_id, elapsed, len(text))
+    return elapsed
+
+
+def probe_outgoing_row(db_path: str, chat_id: str, sent_after_unix_ms: int) -> None:
+    """Background probe (mc-lkbx): after a send reports success, verify an
+    is_from_me row actually landed in chat.db for that chat. AppleScript can
+    return success while Messages.app silently drops the send; this makes that
+    class visible in the log instead of invisible."""
+    def _probe():
+        time.sleep(3.0)
+        try:
+            uri = f"file:{db_path}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True)
+            cur = conn.cursor()
+            cur.execute("PRAGMA query_only = ON")
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM message m
+                JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+                JOIN chat c ON cmj.chat_id = c.ROWID
+                WHERE c.guid = ? AND m.is_from_me = 1 AND m.date > ?
+                """,
+                (chat_id, unix_ms_to_apple_ns(sent_after_unix_ms)),
+            )
+            count = cur.fetchone()[0]
+            conn.close()
+            if count > 0:
+                log.info("send-probe ok chat=%s outgoing_rows=%d", chat_id, count)
+            else:
+                log.warning(
+                    "send-probe MISSING chat=%s - AppleScript succeeded but no "
+                    "outgoing row in chat.db within 3s (silent drop or slow write)",
+                    chat_id,
+                )
+        except Exception as e:
+            log.warning("send-probe error chat=%s: %s", chat_id, e)
+
+    threading.Thread(target=_probe, daemon=True).start()
 
 
 class BridgeHandler(BaseHTTPRequestHandler):
@@ -140,8 +230,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
     db_path: str = ""
 
     def log_message(self, format, *args):
-        # Route access logs to stderr
-        print(f"[bridge] {self.address_string()} - {format % args}", file=sys.stderr)
+        # Route access logs through the rotating, timestamped logger (mc-lkbx)
+        log.info("access %s %s", self.address_string(), format % args)
 
     def send_json(self, status: int, payload) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -156,6 +246,33 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed = urlparse(self.path)
+
+        if parsed.path == "/healthz":
+            checks = {"db_readable": False, "messages_app_running": False}
+            try:
+                uri = f"file:{self.db_path}?mode=ro"
+                conn = sqlite3.connect(uri, uri=True)
+                conn.execute("SELECT 1 FROM message LIMIT 1")
+                conn.close()
+                checks["db_readable"] = True
+            except Exception as e:
+                checks["db_error"] = str(e)[:200]
+            try:
+                r = subprocess.run(["pgrep", "-x", "Messages"], capture_output=True)
+                checks["messages_app_running"] = r.returncode == 0
+            except Exception:
+                pass
+            with _SEND_STATS_LOCK:
+                stats = dict(SEND_STATS)
+            status = 200 if checks["db_readable"] else 503
+            self.send_json(status, {
+                "status": "ok" if status == 200 else "degraded",
+                "uptime_s": int(time.time() - BRIDGE_STARTED_AT),
+                "checks": checks,
+                "send_stats": stats,
+                "version": "0.2.0",
+            })
+            return
 
         if parsed.path != "/messages":
             self.send_error_json(404, "Not found")
@@ -177,7 +294,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         try:
             messages = get_messages(self.db_path, after_unix_ms)
         except RuntimeError as e:
-            print(f"[bridge] ERROR reading messages: {e}", file=sys.stderr)
+            log.error("read messages failed: %s", e)
             self.send_error_json(500, str(e))
             return
 
@@ -215,14 +332,22 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.send_error_json(400, "Field 'text' must be a string")
             return
 
+        sent_at_ms = int(time.time() * 1000) - 2000  # 2s slack for clock/db skew
         try:
-            send_message(chat_id, str(text))
+            elapsed = send_message(chat_id, str(text))
+        except subprocess.TimeoutExpired:
+            with _SEND_STATS_LOCK:
+                SEND_STATS["failed"] += 1
+                SEND_STATS["last_error"] = "osascript timeout after 60s"
+            log.error("send TIMEOUT chat=%s (osascript >60s)", chat_id)
+            self.send_error_json(500, "AppleScript timed out after 60s")
+            return
         except RuntimeError as e:
-            print(f"[bridge] ERROR sending message: {e}", file=sys.stderr)
             self.send_error_json(500, str(e))
             return
 
-        self.send_json(200, {"status": "sent"})
+        probe_outgoing_row(self.db_path, chat_id, sent_at_ms)
+        self.send_json(200, {"status": "sent", "applescript_elapsed_s": round(elapsed, 2)})
 
 
 def make_handler(db_path: str):
@@ -259,7 +384,7 @@ def add_info_endpoint(handler_class, name: str, port: int):
                 "name": name,
                 "hostname": socket.gethostname(),
                 "port": port,
-                "version": "0.1.0",
+                "version": "0.2.0",
             })
             return
         original_do_GET(self)
@@ -299,13 +424,12 @@ def main():
     db_path = os.path.expanduser(args.db)
     service_name = args.name or socket.gethostname()
 
+    setup_logging()
     if not os.path.exists(db_path):
-        print(f"[bridge] WARNING: database not found at {db_path}", file=sys.stderr)
+        log.warning("database not found at %s", db_path)
 
-    print(f"[bridge] Starting iMessage bridge", file=sys.stderr)
-    print(f"[bridge]   name : {service_name}", file=sys.stderr)
-    print(f"[bridge]   port : {args.port}", file=sys.stderr)
-    print(f"[bridge]   db   : {db_path}", file=sys.stderr)
+    log.info("starting iMessage bridge name=%s port=%d db=%s log=%s",
+             service_name, args.port, db_path, LOG_PATH)
 
     handler = make_handler(db_path)
     add_info_endpoint(handler, service_name, args.port)
