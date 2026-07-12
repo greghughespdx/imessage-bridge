@@ -62,6 +62,100 @@ APPLE_EPOCH_OFFSET_S = 978307200
 # chat.db stores dates in nanoseconds since Apple epoch
 NS_PER_MS = 1_000_000
 
+# Attachments live outside chat.db on disk. attachment.filename is an absolute
+# path (sometimes tilde-prefixed) under this directory. Overridable for tests.
+ATTACHMENTS_DIR = os.path.realpath(
+    os.path.expanduser(
+        os.environ.get("IMESSAGE_ATTACHMENTS_DIR", "~/Library/Messages/Attachments")
+    )
+)
+
+# Only image attachments are surfaced/served for now (mc-iee8). Everything else
+# is reported in metadata but not served as bytes.
+IMAGE_MIME_PREFIX = "image/"
+IMAGE_UTIS = {"public.heic", "public.heif", "public.jpeg", "public.png"}
+# Cap a single attachment fetch. Real photos are a few MB; this guards against a
+# pathological row pointing at something huge.
+MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+
+
+def _expand_attachment_path(raw: str) -> str:
+    """Expand a chat.db attachment.filename to an absolute realpath."""
+    return os.path.realpath(os.path.expanduser(raw))
+
+
+def _is_under_attachments_dir(abs_path: str) -> bool:
+    """True if abs_path is inside ATTACHMENTS_DIR (path-traversal guard)."""
+    base = ATTACHMENTS_DIR
+    return abs_path == base or abs_path.startswith(base + os.sep)
+
+
+def _is_image_attachment(mime_type, uti) -> bool:
+    if mime_type and mime_type.startswith(IMAGE_MIME_PREFIX):
+        return True
+    if uti and uti in IMAGE_UTIS:
+        return True
+    return False
+
+
+def _query_attachments(cursor, message_rowid: int) -> list:
+    """Return raw attachment rows for a message, ordered stably by join ROWID.
+
+    Each row: dict with filename, mime_type, transfer_name, uti.
+    """
+    cursor.execute(
+        """
+        SELECT a.filename, a.mime_type, a.transfer_name, a.uti
+        FROM attachment a
+        JOIN message_attachment_join maj ON maj.attachment_id = a.ROWID
+        WHERE maj.message_id = ?
+        ORDER BY maj.ROWID ASC
+        """,
+        (message_rowid,),
+    )
+    out = []
+    for r in cursor.fetchall():
+        out.append({
+            "filename": r["filename"],
+            "mime_type": r["mime_type"],
+            "transfer_name": r["transfer_name"],
+            "uti": r["uti"],
+        })
+    return out
+
+
+def resolve_attachment(db_path: str, msg_guid: str, index: int):
+    """Resolve (abs_path, mime_type, transfer_name, uti) for the index-th
+    attachment of the message with the given GUID, or None if not found.
+
+    Validates the resolved path is a real file under ATTACHMENTS_DIR. Read-only.
+    """
+    uri = f"file:{db_path}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA query_only = ON")
+        cur.execute("SELECT ROWID FROM message WHERE guid = ? LIMIT 1", (msg_guid,))
+        row = cur.fetchone()
+        if row is None:
+            return None
+        atts = _query_attachments(cur, row["ROWID"])
+    finally:
+        conn.close()
+
+    if index < 0 or index >= len(atts):
+        return None
+    att = atts[index]
+    if not att["filename"]:
+        return None
+    abs_path = _expand_attachment_path(att["filename"])
+    if not _is_under_attachments_dir(abs_path):
+        raise PermissionError(f"attachment path outside attachments dir: {abs_path}")
+    if not os.path.isfile(abs_path):
+        return None
+    return abs_path, att["mime_type"], att["transfer_name"], att["uti"]
+
 
 def unix_ms_to_apple_ns(unix_ms: int) -> int:
     """Convert Unix milliseconds to Apple epoch nanoseconds."""
@@ -106,24 +200,39 @@ def get_messages(db_path: str, after_unix_ms: int) -> list:
         # PRAGMA to be extra safe
         cursor.execute("PRAGMA query_only = ON")
 
+        # Surface image-only messages too: those have NULL text and a
+        # cache_has_attachments flag. The old `m.text IS NOT NULL` filter
+        # silently dropped every attachment-only message (mc-iee8).
         query = """
             SELECT
+                m.ROWID AS rowid,
                 m.guid,
                 m.text,
                 m.date,
                 m.is_from_me,
+                m.cache_has_attachments,
                 h.id AS sender,
                 c.guid AS chat_guid
             FROM message m
             LEFT JOIN handle h ON m.handle_id = h.ROWID
             LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
             LEFT JOIN chat c ON cmj.chat_id = c.ROWID
-            WHERE m.text IS NOT NULL
-              AND m.date > ?
+            WHERE m.date > ?
+              AND (m.text IS NOT NULL OR m.cache_has_attachments = 1)
             ORDER BY m.date ASC
         """
         cursor.execute(query, (after_apple_ns,))
         rows = cursor.fetchall()
+
+        # Second pass: resolve attachment metadata for messages that have any.
+        # Client fetches bytes by (message guid, attachment index) via
+        # GET /attachment; server paths are intentionally NOT exposed.
+        attachments_by_rowid = {}
+        for row in rows:
+            if row["cache_has_attachments"]:
+                attachments_by_rowid[row["rowid"]] = _query_attachments(
+                    cursor, row["rowid"]
+                )
     except sqlite3.OperationalError as e:
         conn.close()
         raise RuntimeError(f"Database query failed: {e}")
@@ -132,6 +241,15 @@ def get_messages(db_path: str, after_unix_ms: int) -> list:
 
     messages = []
     for row in rows:
+        raw_atts = attachments_by_rowid.get(row["rowid"], [])
+        attachments = []
+        for i, att in enumerate(raw_atts):
+            attachments.append({
+                "index": i,
+                "mime_type": att["mime_type"],
+                "transfer_name": att["transfer_name"],
+                "is_image": _is_image_attachment(att["mime_type"], att["uti"]),
+            })
         messages.append({
             "guid": row["guid"],
             "text": row["text"],
@@ -139,6 +257,7 @@ def get_messages(db_path: str, after_unix_ms: int) -> list:
             "is_from_me": bool(row["is_from_me"]),
             "sender": row["sender"],
             "chat_guid": row["chat_guid"],
+            "attachments": attachments,
         })
     return messages
 
@@ -274,6 +393,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
             })
             return
 
+        if parsed.path == "/attachment":
+            self.handle_attachment(parsed)
+            return
+
         if parsed.path != "/messages":
             self.send_error_json(404, "Not found")
             return
@@ -299,6 +422,77 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
 
         self.send_json(200, messages)
+
+    def handle_attachment(self, parsed) -> None:
+        """Serve the raw bytes of an image attachment.
+
+        GET /attachment?msg=<message-guid>&index=<n>
+
+        Only image attachments are served. The resolved file must live under
+        ATTACHMENTS_DIR (path-traversal guard). Read-only; never touches the db.
+        """
+        params = parse_qs(parsed.query)
+        msg_list = params.get("msg", [])
+        idx_list = params.get("index", ["0"])
+
+        if not msg_list:
+            self.send_error_json(400, "Missing required query parameter: msg")
+            return
+        msg_guid = msg_list[0]
+        try:
+            index = int(idx_list[0])
+        except ValueError:
+            self.send_error_json(400, "Parameter 'index' must be an integer")
+            return
+
+        try:
+            resolved = resolve_attachment(self.db_path, msg_guid, index)
+        except PermissionError as e:
+            log.warning("attachment blocked: %s", e)
+            self.send_error_json(403, "Attachment path not permitted")
+            return
+        except RuntimeError as e:
+            log.error("attachment lookup failed: %s", e)
+            self.send_error_json(500, str(e))
+            return
+
+        if resolved is None:
+            self.send_error_json(404, "Attachment not found")
+            return
+
+        abs_path, mime_type, transfer_name, uti = resolved
+
+        if not _is_image_attachment(mime_type, uti):
+            self.send_error_json(415, "Only image attachments are served")
+            return
+
+        try:
+            size = os.path.getsize(abs_path)
+            if size > MAX_ATTACHMENT_BYTES:
+                self.send_error_json(413, "Attachment too large")
+                return
+            with open(abs_path, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            log.error("attachment read failed %s: %s", abs_path, e)
+            self.send_error_json(500, "Cannot read attachment")
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", mime_type or "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        if transfer_name:
+            # Safe-ish filename hint for the client's cache naming.
+            safe = os.path.basename(transfer_name)
+            self.send_header(
+                "Content-Disposition", f'inline; filename="{safe}"'
+            )
+        self.end_headers()
+        self.wfile.write(data)
+        log.info(
+            "served attachment msg=%s index=%d bytes=%d mime=%s",
+            msg_guid, index, len(data), mime_type,
+        )
 
     def do_POST(self):
         parsed = urlparse(self.path)
