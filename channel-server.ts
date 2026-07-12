@@ -25,6 +25,13 @@ import { Database } from 'bun:sqlite'
 import * as os from 'os'
 import * as path from 'path'
 import { sendRemoteWithKeepalive } from './remote-send'
+import {
+  materializeImage as materializeImageImpl,
+  pickImageAttachment,
+  isImageAttachment,
+  DEFAULT_IMAGE_CACHE_DIR,
+  type AttachmentMeta,
+} from './attachments'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -43,20 +50,40 @@ const APPLE_EPOCH_OFFSET_S = 978307200
 
 const DB_PATH = path.join(os.homedir(), 'Library', 'Messages', 'chat.db')
 
+// Downloaded/converted images land here (from ./attachments) so the session
+// (harness Read tool) can open them. Mirrors Telegram's local image cache.
+const IMAGE_CACHE_DIR = DEFAULT_IMAGE_CACHE_DIR
+
+// Surface image-only messages too (NULL text + cache_has_attachments); the old
+// `text IS NOT NULL` filter dropped every attachment-only message (mc-iee8).
 const QUERY = `
-  SELECT m.guid,
+  SELECT m.ROWID     AS rowid,
+         m.guid,
          m.text,
          m.date,
          m.is_from_me,
+         m.cache_has_attachments,
          h.id        AS sender,
          c.guid      AS chat_guid
   FROM   message m
   LEFT JOIN handle h           ON m.handle_id = h.ROWID
   LEFT JOIN chat_message_join cmj ON m.ROWID  = cmj.message_id
   LEFT JOIN chat c             ON cmj.chat_id = c.ROWID
-  WHERE  m.date > ? AND m.text IS NOT NULL AND m.is_from_me = 0
+  WHERE  m.date > ?
+    AND  (m.text IS NOT NULL OR m.cache_has_attachments = 1)
+    AND  m.is_from_me = 0
   ORDER  BY m.date ASC
 `
+
+// Local-mode attachment lookup (remote mode gets attachments from the bridge).
+const QUERY_ATTACHMENTS_LOCAL = `
+  SELECT a.filename, a.mime_type, a.transfer_name, a.uti
+  FROM   attachment a
+  JOIN   message_attachment_join maj ON maj.attachment_id = a.ROWID
+  WHERE  maj.message_id = ?
+  ORDER  BY maj.ROWID ASC
+`
+
 
 // ---------------------------------------------------------------------------
 // Bonjour discovery
@@ -338,27 +365,55 @@ type IMessage = {
   date_unix_ms: number
   sender: string | null
   chat_guid: string | null
+  attachments: AttachmentMeta[]
+}
+
+function expandTilde(p: string): string {
+  return p.startsWith('~/') ? path.join(os.homedir(), p.slice(2)) : p
 }
 
 function pollLocal(db: Database): IMessage[] {
   const afterAppleNs = (lastSeenTs / 1000 - APPLE_EPOCH_OFFSET_S) * 1_000_000_000
 
   const rows = db.query(QUERY).all(afterAppleNs) as Array<{
+    rowid: number
     guid: string
-    text: string
+    text: string | null
     date: number
     is_from_me: number
+    cache_has_attachments: number
     sender: string | null
     chat_guid: string | null
   }>
 
-  return rows.map(row => ({
-    guid: row.guid,
-    text: row.text,
-    date_unix_ms: (row.date / 1_000_000_000 + APPLE_EPOCH_OFFSET_S) * 1000,
-    sender: row.sender,
-    chat_guid: row.chat_guid,
-  }))
+  return rows.map(row => {
+    const attachments: AttachmentMeta[] = []
+    if (row.cache_has_attachments) {
+      const attRows = db.query(QUERY_ATTACHMENTS_LOCAL).all(row.rowid) as Array<{
+        filename: string | null
+        mime_type: string | null
+        transfer_name: string | null
+        uti: string | null
+      }>
+      attRows.forEach((a, index) => {
+        attachments.push({
+          index,
+          mime_type: a.mime_type,
+          transfer_name: a.transfer_name,
+          is_image: isImageAttachment(a.mime_type, a.uti),
+          localPath: a.filename ? expandTilde(a.filename) : undefined,
+        })
+      })
+    }
+    return {
+      guid: row.guid,
+      text: row.text ?? '',
+      date_unix_ms: (row.date / 1_000_000_000 + APPLE_EPOCH_OFFSET_S) * 1000,
+      sender: row.sender,
+      chat_guid: row.chat_guid,
+      attachments,
+    }
+  })
 }
 
 async function pollRemote(bridgeUrl: string): Promise<IMessage[]> {
@@ -380,21 +435,43 @@ async function pollRemote(bridgeUrl: string): Promise<IMessage[]> {
   return (
     data as Array<{
       guid: string
-      text: string
+      text: string | null
       date: number // unix ms (bridge already converts)
       is_from_me: boolean
       sender: string | null
       chat_guid: string | null
+      attachments?: AttachmentMeta[]
     }>
   )
     .filter(row => !row.is_from_me)
     .map(row => ({
       guid: row.guid,
-      text: row.text,
+      text: row.text ?? '',
       date_unix_ms: row.date,
       sender: row.sender,
       chat_guid: row.chat_guid,
+      attachments: row.attachments ?? [],
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Image materialization: get the first image attachment onto local disk in a
+// harness-readable format (HEIC->PNG). Delegates to ./attachments.
+// ---------------------------------------------------------------------------
+
+async function materializeImage(msg: IMessage): Promise<string | undefined> {
+  const att = pickImageAttachment(msg.attachments)
+  if (!att) return undefined
+  return materializeImageImpl({
+    guid: msg.guid,
+    attachment: att,
+    source:
+      mode.kind === 'remote'
+        ? { kind: 'remote', bridgeUrl: mode.bridgeUrl }
+        : { kind: 'local' },
+    cacheDir: IMAGE_CACHE_DIR,
+    log: m => process.stderr.write(`imessage: ${m}\n`),
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -409,6 +486,7 @@ const mcp = new Server(
       'iMessages arrive as <channel source="imessage" chat_id="..." message_id="..." from="..." ts="..."> events.',
       'Each event carries meta fields: chat_id (iMessage chat GUID, e.g. "iMessage;-;+15034102254"),',
       'message_id (message GUID for reference), from (sender phone/email), and ts (ISO timestamp).',
+      'If the tag has an image_path attribute, Read that file — it is an image the sender attached (HEIC is converted to PNG).',
       '',
       'When you receive an iMessage, read it and respond using the reply tool.',
       'The reply tool requires chat_id (from the meta) and the text you want to send.',
@@ -509,16 +587,22 @@ async function poll(): Promise<void> {
       lastSeenTs = msg.date_unix_ms
     }
 
+    // Pull the first image attachment onto local disk (HEIC->PNG) so the
+    // session can Read it, then advertise it via image_path in meta.
+    const imagePath = await materializeImage(msg)
+    const content = msg.text || (imagePath ? '(image)' : '')
+
     mcp
       .notification({
         method: 'notifications/claude/channel',
         params: {
-          content: msg.text,
+          content,
           meta: {
             chat_id: msg.chat_guid ?? '',
             message_id: msg.guid,
             from: msg.sender ?? 'unknown',
             ts: new Date(msg.date_unix_ms).toISOString(),
+            ...(imagePath ? { image_path: imagePath } : {}),
           },
         },
       })
