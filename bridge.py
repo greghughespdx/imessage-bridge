@@ -482,8 +482,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", mime_type or "application/octet-stream")
         self.send_header("Content-Length", str(len(data)))
         if transfer_name:
-            # Safe-ish filename hint for the client's cache naming.
+            # Safe-ish filename hint for the client's cache naming. Headers are
+            # latin-1 only; iOS screenshot names carry U+202F (narrow no-break
+            # space before AM/PM) which crashed the whole handler with an
+            # UnicodeEncodeError (found live 2026-07-12). ASCII-fold the hint;
+            # the bytes and mime type are what matter to the client.
             safe = os.path.basename(transfer_name)
+            safe = safe.encode("ascii", "replace").decode("ascii").replace('"', "_")
             self.send_header(
                 "Content-Disposition", f'inline; filename="{safe}"'
             )

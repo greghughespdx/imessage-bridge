@@ -295,5 +295,18 @@ class RealFixtureTest(unittest.TestCase):
         self.assertTrue(match[0]["attachments"][0]["is_image"])
 
 
+
+
+class TestHeaderFilenameFold(unittest.TestCase):
+    """U+202F in iOS screenshot names crashed handle_attachment (2026-07-12)."""
+
+    def test_narrow_nbsp_filename_encodes_latin1(self):
+        import os
+        name = "Screenshot 2026-07-12 at 8.49\u202fAM.png"
+        safe = os.path.basename(name)
+        safe = safe.encode("ascii", "replace").decode("ascii").replace('"', "_")
+        header = 'inline; filename="%s"' % safe
+        header.encode("latin-1", "strict")  # must not raise
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
