@@ -25,6 +25,9 @@ import bridge
 
 # Smallest thing that is unambiguously a PNG by signature and extension. The
 # bridge does not parse image bytes, so content beyond this is irrelevant.
+# Throwaway value. Never a real token, and never read from disk (mc-btl9u).
+TEST_TOKEN = "test-token-not-a-real-secret"
+
 PNG_BYTES = (
     b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
     b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
@@ -239,7 +242,7 @@ class SendRouteTest(unittest.TestCase):
         bridge.send_message = fake_send
         bridge.probe_outgoing_row = lambda *a, **k: None
 
-        handler = bridge.make_handler(self.db_path)
+        handler = bridge.make_handler(self.db_path, TEST_TOKEN)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -252,12 +255,13 @@ class SendRouteTest(unittest.TestCase):
         bridge.probe_outgoing_row = self._orig_probe
         bridge.OUTBOX_DIR = self._orig_outbox
 
-    def _post(self, payload):
+    def _post(self, payload, token=TEST_TOKEN):
         raw = json.dumps(payload).encode("utf-8")
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        conn.request(
-            "POST", "/send", body=raw, headers={"Content-Type": "application/json"}
-        )
+        headers = {"Content-Type": "application/json"}
+        if token is not None:
+            headers[bridge.AUTH_HEADER] = token
+        conn.request("POST", "/send", body=raw, headers=headers)
         resp = conn.getresponse()
         body = resp.read()
         conn.close()

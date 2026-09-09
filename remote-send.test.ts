@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 import { sendRemoteWithKeepalive, type FetchImpl } from './remote-send'
+import { BRIDGE_TOKEN_HEADER } from './bridge-auth'
+
+// Throwaway value. These tests never read a real token file (mc-btl9u).
+const TEST_TOKEN = 'test-token-not-a-real-secret'
 
 type FetchCall = {
   body?: string
@@ -37,6 +41,7 @@ describe('sendRemoteWithKeepalive', () => {
     await sendRemoteWithKeepalive('http://bridge.local:8432/', 'chat-id', 'hello', {
       fetchImpl,
       retryDelayMs: 0,
+      token: TEST_TOKEN,
     })
 
     expect(calls.map(call => call.url)).toEqual([
@@ -60,6 +65,7 @@ describe('sendRemoteWithKeepalive', () => {
     await sendRemoteWithKeepalive('http://bridge.local:8432', 'chat-id', 'hello', {
       fetchImpl,
       retryDelayMs: 0,
+      token: TEST_TOKEN,
     })
 
     expect(calls.map(call => call.url)).toEqual([
@@ -81,6 +87,7 @@ describe('sendRemoteWithKeepalive', () => {
     await sendRemoteWithKeepalive('http://bridge.local:8432', 'chat-id', 'hello', {
       fetchImpl,
       retryDelayMs: 0,
+      token: TEST_TOKEN,
     })
 
     expect(calls.map(call => call.url)).toEqual([
@@ -100,6 +107,7 @@ describe('sendRemoteWithKeepalive', () => {
     await sendRemoteWithKeepalive('http://bridge.local:8432', 'chat-id', 'hello', {
       fetchImpl,
       retryDelayMs: 0,
+      token: TEST_TOKEN,
     })
 
     expect(calls).toHaveLength(2)
@@ -124,6 +132,7 @@ describe('sendRemoteWithKeepalive', () => {
     await sendRemoteWithKeepalive('http://bridge.local:8432', 'chat-id', 'hello', {
       fetchImpl,
       retryDelayMs: 0,
+      token: TEST_TOKEN,
     })
   })
 
@@ -137,6 +146,7 @@ describe('sendRemoteWithKeepalive', () => {
       attachment: { base64: 'aW1hZ2UtYnl0ZXM=', name: 'crop.png' },
       fetchImpl,
       retryDelayMs: 0,
+      token: TEST_TOKEN,
     })
 
     expect(JSON.parse(calls[1].body ?? '{}')).toEqual({
@@ -157,6 +167,7 @@ describe('sendRemoteWithKeepalive', () => {
       attachment: { path: '/Users/someone/crop.png' },
       fetchImpl,
       retryDelayMs: 0,
+      token: TEST_TOKEN,
     })
 
     expect(JSON.parse(calls[1].body ?? '{}')).toEqual({
@@ -175,6 +186,7 @@ describe('sendRemoteWithKeepalive', () => {
     await sendRemoteWithKeepalive('http://bridge.local:8432', 'chat-id', 'hello', {
       fetchImpl,
       retryDelayMs: 0,
+      token: TEST_TOKEN,
     })
 
     const body = JSON.parse(calls[1].body ?? '{}')
@@ -194,6 +206,7 @@ describe('sendRemoteWithKeepalive', () => {
       attachment: { base64: 'aW1hZ2UtYnl0ZXM=', name: 'crop.png' },
       fetchImpl,
       retryDelayMs: 0,
+      token: TEST_TOKEN,
     })
 
     expect(JSON.parse(calls[3].body ?? '{}').attachment_name).toBe('crop.png')
@@ -210,7 +223,46 @@ describe('sendRemoteWithKeepalive', () => {
         attempts: 1,
         fetchImpl,
         retryDelayMs: 0,
+      token: TEST_TOKEN,
       }),
     ).rejects.toThrow('bridge send failed after 1 attempt(s): bridge returned 500: bad chat')
+  })
+})
+
+describe('bridge token header', () => {
+  test('every bridge request carries X-Bridge-Token', async () => {
+    const { calls, fetchImpl } = makeFetch(call => {
+      if (call.url.endsWith('/info')) return new Response('{}', { status: 200 })
+      return new Response('{"status":"sent"}', { status: 200 })
+    })
+
+    await sendRemoteWithKeepalive('http://bridge.local:8432', 'chat-id', 'hello', {
+      fetchImpl,
+      retryDelayMs: 0,
+      token: TEST_TOKEN,
+    })
+
+    // Both the keepalive probe and the send, not just the send.
+    expect(calls).toHaveLength(2)
+    for (const call of calls) {
+      const headers = call.init?.headers as Record<string, string>
+      expect(headers[BRIDGE_TOKEN_HEADER]).toBe(TEST_TOKEN)
+    }
+  })
+
+  test('a 401 from the bridge is reported, not swallowed', async () => {
+    const { fetchImpl } = makeFetch(call => {
+      if (call.url.endsWith('/info')) return new Response('{}', { status: 200 })
+      return new Response('{"error":"unauthorized"}', { status: 401 })
+    })
+
+    await expect(
+      sendRemoteWithKeepalive('http://bridge.local:8432', 'chat-id', 'hello', {
+        attempts: 1,
+        fetchImpl,
+        retryDelayMs: 0,
+        token: TEST_TOKEN,
+      }),
+    ).rejects.toThrow('bridge returned 401')
   })
 })

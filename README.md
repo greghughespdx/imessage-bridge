@@ -171,6 +171,40 @@ To connect to a specific bridge by name (when multiple bridges are on the networ
 
 ## API reference
 
+### Authentication (required on every route)
+
+Every request needs an `X-Bridge-Token` header whose value matches a shared
+secret. Without it, or with the wrong value, every route returns `401` with the
+body `{"error": "unauthorized"}` - the same body either way, so a caller learns
+nothing from the difference.
+
+The secret lives in a file that must be mode `0600`. The bridge reads it once at
+startup and **refuses to start** if the file is missing, group/world accessible,
+or empty. There is no way to turn the check off.
+
+```bash
+# On the bridge host, and on every machine that talks to it:
+mkdir -p ~/.config/imessage-bridge
+install -m 600 /dev/null ~/.config/imessage-bridge/token
+# write the same secret into that file on both ends, then:
+chmod 600 ~/.config/imessage-bridge/token
+```
+
+`IMESSAGE_BRIDGE_TOKEN_FILE` overrides the location on both ends. Clients in this
+repo (`remote-send.ts`, `attachments.ts`, `channel-server.ts`) read it through
+`bridge-auth.ts` and send the header automatically; there is no unauthenticated
+client path.
+
+Every example below omits the header for readability. Add
+`-H "X-Bridge-Token: $(cat ~/.config/imessage-bridge/token)"` to each one.
+
+### Listen address
+
+The bridge binds **one** address, never `0.0.0.0`. By default it resolves this
+host's LAN IPv4 and binds that, falling back to `127.0.0.1` when there is no LAN
+address. `--bind <address>` overrides it; a wildcard (`0.0.0.0`, `::`, `*`) is
+refused at startup rather than silently accepted.
+
 **Get messages since a timestamp:**
 
 ```
@@ -215,7 +249,7 @@ The text is sent first, then the image as a second message to the same chat, so 
 
 Images only (`.png .jpg .jpeg .heic .heif .gif .webp .bmp .tif .tiff`, or anything `mimetypes` calls `image/*`), 50MB cap. Anything else is a `400`.
 
-**Security note:** `/send` has no authentication, and `attachment_path` will send any image file readable by the bridge process to any chat the caller names. Treat the bridge port the way you would treat unauthenticated shell access to that Mac: bind it to a trusted LAN only, exactly as the plain-text `/send` route already requires.
+**Security note:** `attachment_path` will send any image file readable by the bridge process to any chat the caller names, so anyone holding the shared token can read images off that Mac. The token and the single-interface bind are what stand between the LAN and that capability; treat the token the way you would treat an SSH key for that machine, and do not put it in a repo, a log, or a shell history.
 
 **Fetch an inbound image attachment:**
 
@@ -241,12 +275,14 @@ Returns `{"name": "...", "hostname": "...", "port": 8432, "version": "0.1.0"}`.
 | `--name` | hostname | Bonjour service name for discovery |
 | `--db` | ~/Library/Messages/chat.db | Path to the Messages database |
 | `--no-bonjour` | off | Disable Bonjour/mDNS advertisement |
+| `--bind` | this host's LAN IPv4 (else 127.0.0.1) | Address to listen on. A wildcard such as `0.0.0.0` is refused. |
 
 The installer also reads `IMESSAGE_BRIDGE_PORT` and `IMESSAGE_BRIDGE_NAME` environment variables.
 
 | Environment variable | Default | Description |
 |----------------------|---------|-------------|
 | `IMESSAGE_BRIDGE_LOG` | /usr/local/var/log/imessage-bridge-app.log | Rotating application log |
+| `IMESSAGE_BRIDGE_TOKEN_FILE` | ~/.config/imessage-bridge/token | Shared secret for the `X-Bridge-Token` header. Must be `0600`. Read by the bridge AND by every client. |
 | `IMESSAGE_BRIDGE_OUTBOX_DIR` | ~/.imessage-bridge/outbox | Where `attachment_b64` uploads are staged before sending. Created `0700`; files are `0600` and deleted after the send. Messages.app must be able to read this path. |
 | `IMESSAGE_ATTACHMENTS_DIR` | ~/Library/Messages/Attachments | Base directory inbound attachments must live under |
 

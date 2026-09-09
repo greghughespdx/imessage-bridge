@@ -10,6 +10,7 @@ Usage:
 import argparse
 import base64
 import binascii
+import hmac
 import json
 import logging
 import logging.handlers
@@ -18,6 +19,7 @@ import os
 import platform
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -52,6 +54,149 @@ def setup_logging() -> None:
     sh = logging.StreamHandler(sys.stderr)
     sh.setFormatter(fmt)
     log.addHandler(sh)
+
+
+# ---------------------------------------------------------------------------
+# Shared-secret authentication (mc-btl9u, Greg 2026-09-09)
+#
+# Every route requires an X-Bridge-Token header matching a secret read once at
+# startup from a 0600 file. Before this, anyone who could reach the port could
+# read every message on the Mac and send as Greg.
+#
+# Fail closed in both directions: the bridge refuses to START without a
+# readable, correctly-permissioned, non-empty token file, and refuses every
+# request whose header does not match. There is no unauthenticated mode and no
+# way to turn the check off, because a flag to disable it is a flag that gets
+# left on.
+# ---------------------------------------------------------------------------
+
+AUTH_HEADER = "X-Bridge-Token"
+DEFAULT_TOKEN_FILE = "~/.config/imessage-bridge/token"
+
+# How often one source address may produce an "unauthorized" log line. Without
+# this a scanner turns the log into a flood; with it, a real attempt is still
+# visible within a minute.
+AUTH_LOG_INTERVAL_S = 60.0
+# Ceiling on the addresses tracked for that rate limit, so a caller cycling
+# source addresses cannot grow the dict without bound.
+AUTH_LOG_MAX_TRACKED = 512
+
+_AUTH_LOG_SEEN = {}
+_AUTH_LOG_LOCK = threading.Lock()
+
+
+def token_file_path(env=None) -> str:
+    """Absolute path of the token file. IMESSAGE_BRIDGE_TOKEN_FILE overrides."""
+    environ = os.environ if env is None else env
+    return os.path.expanduser(
+        environ.get("IMESSAGE_BRIDGE_TOKEN_FILE") or DEFAULT_TOKEN_FILE
+    )
+
+
+def load_bridge_token(path=None) -> str:
+    """Read the shared secret once, at startup.
+
+    Raises RuntimeError with an actionable message if the file is missing,
+    world/group readable, or empty. Never logs or returns the value anywhere
+    except to the caller.
+    """
+    path = path or token_file_path()
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        raise RuntimeError(
+            "cannot read the bridge token file %s: %s. Create it with "
+            "`install -m 600 /dev/null %s` and write the shared secret into it, "
+            "or set IMESSAGE_BRIDGE_TOKEN_FILE." % (path, e, path)
+        )
+    if not stat.S_ISREG(st.st_mode):
+        raise RuntimeError("bridge token file %s is not a regular file" % path)
+    if st.st_mode & 0o077:
+        raise RuntimeError(
+            "bridge token file %s is group or world accessible (mode %o). "
+            "Run `chmod 600 %s`." % (path, stat.S_IMODE(st.st_mode), path)
+        )
+    try:
+        with open(path, "r") as f:
+            token = f.read().strip()
+    except OSError as e:
+        raise RuntimeError("cannot read the bridge token file %s: %s" % (path, e))
+    if not token:
+        raise RuntimeError("bridge token file %s is empty" % path)
+    return token
+
+
+def token_matches(expected: str, presented) -> bool:
+    """Constant-time comparison. A missing header is a non-match, not a crash."""
+    if not expected or not presented:
+        return False
+    return hmac.compare_digest(expected, presented)
+
+
+def should_log_auth_failure(addr: str, now=None) -> bool:
+    """True at most once per source address per AUTH_LOG_INTERVAL_S."""
+    now = time.time() if now is None else now
+    with _AUTH_LOG_LOCK:
+        last = _AUTH_LOG_SEEN.get(addr)
+        if last is not None and now - last < AUTH_LOG_INTERVAL_S:
+            return False
+        if len(_AUTH_LOG_SEEN) >= AUTH_LOG_MAX_TRACKED:
+            stale = [
+                a for a, t in _AUTH_LOG_SEEN.items()
+                if now - t >= AUTH_LOG_INTERVAL_S
+            ]
+            for a in stale:
+                del _AUTH_LOG_SEEN[a]
+            if len(_AUTH_LOG_SEEN) >= AUTH_LOG_MAX_TRACKED:
+                _AUTH_LOG_SEEN.clear()
+        _AUTH_LOG_SEEN[addr] = now
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Bind address (mc-btl9u)
+#
+# The bridge used to listen on 0.0.0.0, which is every interface the Mac has,
+# including any VPN or guest network it later joins. It now binds one address.
+# ---------------------------------------------------------------------------
+
+WILDCARD_ADDRESSES = {"0.0.0.0", "::", "*", ""}
+
+
+def detect_lan_ipv4() -> str:
+    """This host's LAN IPv4, or 127.0.0.1 when there is no usable one.
+
+    Opens a UDP socket toward a TEST-NET-1 address and asks the kernel which
+    local address it would use. No packets are sent and nothing is contacted.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("192.0.2.1", 9))
+        addr = sock.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        sock.close()
+    if not addr or addr in WILDCARD_ADDRESSES or addr.startswith("127."):
+        return "127.0.0.1"
+    return addr
+
+
+def resolve_bind_address(requested=None) -> str:
+    """Resolve the listen address. Never returns a wildcard.
+
+    Raises ValueError when a wildcard is requested explicitly, so a well-meant
+    `--bind 0.0.0.0` fails loudly instead of quietly reopening the hole.
+    """
+    if requested is None:
+        return detect_lan_ipv4()
+    requested = requested.strip()
+    if requested in WILDCARD_ADDRESSES:
+        raise ValueError(
+            "--bind %r listens on every interface. Name one address, or omit "
+            "--bind to use this host's LAN IPv4." % requested
+        )
+    return requested
 
 
 BRIDGE_STARTED_AT = time.time()
@@ -675,6 +820,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     # Set by the server after construction
     db_path: str = ""
+    auth_token: str = ""
 
     def log_message(self, format, *args):
         # Route access logs through the rotating, timestamped logger (mc-lkbx)
@@ -691,7 +837,34 @@ class BridgeHandler(BaseHTTPRequestHandler):
     def send_error_json(self, status: int, message: str) -> None:
         self.send_json(status, {"error": message})
 
+    def require_token(self) -> bool:
+        """Gate every route on the shared secret (mc-btl9u).
+
+        Returns True when the request may proceed. On failure it has already
+        written the 401 response, so the caller just returns.
+
+        The 401 body is the same generic object whether the header was absent
+        or wrong, so a caller learns nothing from the difference.
+        """
+        presented = self.headers.get(AUTH_HEADER)
+        if token_matches(self.auth_token, presented):
+            return True
+        addr = self.client_address[0] if self.client_address else "unknown"
+        if should_log_auth_failure(addr):
+            # Path and source only. The presented token NEVER reaches the log.
+            log.warning(
+                "unauthorized request from %s %s %s (further failures from this "
+                "address suppressed for %ds)",
+                addr, self.command, self.path.split("?", 1)[0],
+                int(AUTH_LOG_INTERVAL_S),
+            )
+        self.send_json(401, {"error": "unauthorized"})
+        return False
+
     def do_GET(self):
+        if not self.require_token():
+            return
+
         parsed = urlparse(self.path)
 
         if parsed.path == "/healthz":
@@ -828,6 +1001,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
         )
 
     def do_POST(self):
+        if not self.require_token():
+            return
+
         parsed = urlparse(self.path)
 
         if parsed.path != "/send":
@@ -923,11 +1099,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
         })
 
 
-def make_handler(db_path: str):
-    """Return a BridgeHandler subclass with db_path baked in."""
+def make_handler(db_path: str, auth_token: str = ""):
+    """Return a BridgeHandler subclass with db_path and the token baked in."""
     class Handler(BridgeHandler):
         pass
     Handler.db_path = db_path
+    Handler.auth_token = auth_token
     return Handler
 
 
@@ -951,6 +1128,10 @@ def add_info_endpoint(handler_class, name: str, port: int):
     original_do_GET = handler_class.do_GET
 
     def do_GET_with_info(self):
+        # /info is served by this wrapper before the base do_GET runs, so it
+        # needs its own gate or it would be the one unauthenticated route.
+        if not self.require_token():
+            return
         parsed = urlparse(self.path)
         if parsed.path == "/info":
             self.send_json(200, {
@@ -992,6 +1173,15 @@ def main():
         action="store_true",
         help="Disable Bonjour/mDNS service registration",
     )
+    parser.add_argument(
+        "--bind",
+        type=str,
+        default=None,
+        help=(
+            "Address to listen on (default: this host's LAN IPv4, or 127.0.0.1 "
+            "if there is none). A wildcard such as 0.0.0.0 is refused."
+        ),
+    )
     args = parser.parse_args()
 
     db_path = os.path.expanduser(args.db)
@@ -1001,12 +1191,30 @@ def main():
     if not os.path.exists(db_path):
         log.warning("database not found at %s", db_path)
 
-    log.info("starting iMessage bridge name=%s port=%d db=%s log=%s",
-             service_name, args.port, db_path, LOG_PATH)
+    # Fail closed, before the socket exists: no token, no bridge (mc-btl9u).
+    try:
+        auth_token = load_bridge_token()
+    except RuntimeError as e:
+        log.error("refusing to start: %s", e)
+        print("[bridge] refusing to start: %s" % e, file=sys.stderr)
+        sys.exit(2)
 
-    handler = make_handler(db_path)
+    try:
+        bind_addr = resolve_bind_address(args.bind)
+    except ValueError as e:
+        log.error("refusing to start: %s", e)
+        print("[bridge] refusing to start: %s" % e, file=sys.stderr)
+        sys.exit(2)
+
+    log.info(
+        "starting iMessage bridge name=%s bind=%s port=%d db=%s log=%s "
+        "auth=required token_file=%s",
+        service_name, bind_addr, args.port, db_path, LOG_PATH, token_file_path(),
+    )
+
+    handler = make_handler(db_path, auth_token)
     add_info_endpoint(handler, service_name, args.port)
-    server = ThreadingHTTPServer(("0.0.0.0", args.port), handler)
+    server = ThreadingHTTPServer((bind_addr, args.port), handler)
 
     # Register via Bonjour
     bonjour_proc = None
@@ -1017,7 +1225,7 @@ def main():
         except FileNotFoundError:
             print(f"[bridge] Bonjour: dns-sd not found, skipping registration", file=sys.stderr)
 
-    print(f"[bridge] Listening on 0.0.0.0:{args.port}", file=sys.stderr)
+    print(f"[bridge] Listening on {bind_addr}:{args.port}", file=sys.stderr)
 
     try:
         server.serve_forever()

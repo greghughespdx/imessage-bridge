@@ -28,6 +28,9 @@ import bridge
 
 APPLE_EPOCH_OFFSET_S = 978307200
 
+# Throwaway value. Never a real token, and never read from disk (mc-btl9u).
+TEST_TOKEN = "test-token-not-a-real-secret"
+
 
 def unix_ms_to_apple_ns(unix_ms: int) -> int:
     return int((unix_ms / 1000.0 - APPLE_EPOCH_OFFSET_S) * 1_000_000_000)
@@ -222,7 +225,7 @@ class AttachmentHttpTests(unittest.TestCase):
         self._orig_att_dir = bridge.ATTACHMENTS_DIR
         bridge.ATTACHMENTS_DIR = os.path.realpath(self.att_dir)
 
-        handler = bridge.make_handler(self.db_path)
+        handler = bridge.make_handler(self.db_path, TEST_TOKEN)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -233,9 +236,10 @@ class AttachmentHttpTests(unittest.TestCase):
         self.server.server_close()
         bridge.ATTACHMENTS_DIR = self._orig_att_dir
 
-    def _get(self, path):
+    def _get(self, path, token=TEST_TOKEN):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        conn.request("GET", path)
+        headers = {} if token is None else {bridge.AUTH_HEADER: token}
+        conn.request("GET", path, headers=headers)
         resp = conn.getresponse()
         body = resp.read()
         conn.close()

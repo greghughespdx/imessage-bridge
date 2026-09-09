@@ -1,3 +1,5 @@
+import { bridgeAuthHeaders } from './bridge-auth'
+
 export type FetchImpl = (
   input: string | URL | Request,
   init?: RequestInit,
@@ -20,6 +22,12 @@ export type RemoteAttachment =
 
 export type RemoteSendOptions = {
   attachment?: RemoteAttachment
+  /**
+   * Shared secret for the X-Bridge-Token header (mc-btl9u). Omit it and the
+   * token is read from the file named by IMESSAGE_BRIDGE_TOKEN_FILE. There is
+   * no unauthenticated path: a bridge request without the header is a 401.
+   */
+  token?: string
   attempts?: number
   fetchImpl?: FetchImpl
   probeBeforeSend?: boolean
@@ -74,7 +82,7 @@ function delay(ms: number): Promise<void> {
 
 export async function probeRemoteBridge(
   bridgeUrl: string,
-  options: Pick<RemoteSendOptions, 'fetchImpl' | 'timeoutMs'> = {},
+  options: Pick<RemoteSendOptions, 'fetchImpl' | 'timeoutMs' | 'token'> = {},
 ): Promise<void> {
   const fetchImpl = options.fetchImpl ?? fetch
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
@@ -84,7 +92,12 @@ export async function probeRemoteBridge(
   // keep this probe about connection freshness rather than policy.
   const res = await fetchImpl(
     bridgeEndpoint(bridgeUrl, '/info'),
-    requestInit({ headers: { Accept: 'application/json' } }, timeoutMs),
+    requestInit(
+      {
+        headers: { Accept: 'application/json', ...bridgeAuthHeaders(options.token) },
+      },
+      timeoutMs,
+    ),
   )
   await res.arrayBuffer().catch(() => undefined)
 }
@@ -93,7 +106,10 @@ export async function postRemoteMessage(
   bridgeUrl: string,
   chatId: string,
   text: string,
-  options: Pick<RemoteSendOptions, 'attachment' | 'fetchImpl' | 'timeoutMs'> = {},
+  options: Pick<
+    RemoteSendOptions,
+    'attachment' | 'fetchImpl' | 'timeoutMs' | 'token'
+  > = {},
 ): Promise<void> {
   const fetchImpl = options.fetchImpl ?? fetch
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
@@ -103,7 +119,10 @@ export async function postRemoteMessage(
     requestInit(
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          ...bridgeAuthHeaders(options.token),
+        },
         body: JSON.stringify(sendPayload(chatId, text, options.attachment)),
       },
       timeoutMs,

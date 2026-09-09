@@ -32,6 +32,7 @@ import {
   DEFAULT_IMAGE_CACHE_DIR,
   type AttachmentMeta,
 } from './attachments'
+import { bridgeAuthHeaders, bridgeTokenFilePath } from './bridge-auth'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -234,9 +235,18 @@ async function discoverViaBonjour(): Promise<string | null> {
 async function logBridgeInfo(bridgeUrl: string): Promise<void> {
   try {
     const res = await fetch(`${bridgeUrl}/info`, {
-      headers: { Accept: 'application/json' },
+      headers: { Accept: 'application/json', ...bridgeAuthHeaders() },
       signal: AbortSignal.timeout(3000),
     })
+    if (res.status === 401) {
+      // Say this plainly. A 401 here means the token file on this machine does
+      // not match the bridge's, and every poll and send will fail the same way.
+      process.stderr.write(
+        `imessage: bridge rejected our token (401). Check ${bridgeTokenFilePath()} ` +
+          'against the token file on the bridge host.\n',
+      )
+      return
+    }
     if (res.ok) {
       const info = (await res.json()) as Record<string, unknown>
       const name = info.name ?? info.bridge_name ?? '(unknown)'
@@ -418,9 +428,15 @@ function pollLocal(db: Database): IMessage[] {
 
 async function pollRemote(bridgeUrl: string): Promise<IMessage[]> {
   const res = await fetch(`${bridgeUrl}/messages?after=${lastSeenTs}`, {
-    headers: { Accept: 'application/json' },
+    headers: { Accept: 'application/json', ...bridgeAuthHeaders() },
   })
 
+  if (res.status === 401) {
+    throw new Error(
+      `bridge poll returned 401: the token in ${bridgeTokenFilePath()} does not ` +
+        'match the bridge host',
+    )
+  }
   if (!res.ok) {
     const body = await res.text().catch(() => '(no body)')
     throw new Error(`bridge poll returned ${res.status}: ${body}`)
@@ -486,11 +502,11 @@ const mcp = new Server(
       'iMessages arrive as <channel source="imessage" chat_id="..." message_id="..." from="..." ts="..."> events.',
       'Each event carries meta fields: chat_id (iMessage chat GUID, e.g. "iMessage;-;+15034102254"),',
       'message_id (message GUID for reference), from (sender phone/email), and ts (ISO timestamp).',
-      'If the tag has an image_path attribute, Read that file — it is an image the sender attached (HEIC is converted to PNG).',
+      'If the tag has an image_path attribute, Read that file - it is an image the sender attached (HEIC is converted to PNG).',
       '',
       'When you receive an iMessage, read it and respond using the reply tool.',
       'The reply tool requires chat_id (from the meta) and the text you want to send.',
-      'Always respond promptly — the sender is waiting on their phone.',
+      'Always respond promptly - the sender is waiting on their phone.',
     ].join('\n'),
   },
 )

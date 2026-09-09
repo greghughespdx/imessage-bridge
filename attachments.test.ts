@@ -25,6 +25,7 @@ import {
   safeName,
   type AttachmentMeta,
 } from './attachments'
+import { bridgeAuthHeaders } from './bridge-auth'
 
 const APPLE_EPOCH_OFFSET_S = 978307200
 const nowMs = Date.now()
@@ -40,6 +41,11 @@ const PNG_1X1 = Buffer.from(
 )
 
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47])
+
+// Throwaway value written to a temp file for the spawned bridge (mc-btl9u).
+// Never a real token and never read from the developer's own token file.
+const TEST_TOKEN = 'test-token-not-a-real-secret'
+let tokenFile: string
 
 let tmp: string
 let dbPath: string
@@ -60,6 +66,7 @@ async function waitForBridge(url: string, timeoutMs = 8000): Promise<void> {
   while (Date.now() < deadline) {
     try {
       const res = await fetch(`${url}/healthz`, {
+        headers: bridgeAuthHeaders(TEST_TOKEN),
         signal: AbortSignal.timeout(1000),
       })
       if (res.ok || res.status === 503) return
@@ -146,7 +153,13 @@ beforeAll(async () => {
   }
   db.close()
 
-  // Start the real bridge.py.
+  // The bridge refuses to start without a 0600 token file (mc-btl9u).
+  tokenFile = path.join(tmp, 'token')
+  fs.writeFileSync(tokenFile, TEST_TOKEN + '\n', { mode: 0o600 })
+  fs.chmodSync(tokenFile, 0o600)
+
+  // Start the real bridge.py. --bind 127.0.0.1 keeps the test bridge off the
+  // LAN; the default would be this machine's LAN address.
   const port = 18400 + Math.floor(Math.random() * 900)
   bridgeUrl = `http://127.0.0.1:${port}`
   bridgeProc = Bun.spawn(
@@ -158,12 +171,15 @@ beforeAll(async () => {
       '--db',
       dbPath,
       '--no-bonjour',
+      '--bind',
+      '127.0.0.1',
     ],
     {
       env: {
         ...process.env,
         IMESSAGE_ATTACHMENTS_DIR: attDir,
         IMESSAGE_BRIDGE_LOG: path.join(tmp, 'bridge.log'),
+        IMESSAGE_BRIDGE_TOKEN_FILE: tokenFile,
       },
       stdout: 'ignore',
       stderr: 'ignore',
@@ -203,7 +219,9 @@ describe('pure helpers', () => {
 
 describe('bridge /messages + /attachment', () => {
   test('image-only message surfaces with attachment metadata', async () => {
-    const res = await fetch(`${bridgeUrl}/messages?after=0`)
+    const res = await fetch(`${bridgeUrl}/messages?after=0`, {
+      headers: bridgeAuthHeaders(TEST_TOKEN),
+    })
     expect(res.ok).toBe(true)
     const msgs = (await res.json()) as any[]
     const m = msgs.find(x => x.guid === 'GUID-PNG')
@@ -215,13 +233,17 @@ describe('bridge /messages + /attachment', () => {
   })
 
   test('fetchAttachmentBytes returns the exact file bytes', async () => {
-    const bytes = await fetchAttachmentBytes(bridgeUrl, 'GUID-PNG', 0)
+    const bytes = await fetchAttachmentBytes(
+      bridgeUrl, 'GUID-PNG', 0, undefined, TEST_TOKEN,
+    )
     expect(bytes).not.toBeNull()
     expect(Buffer.from(bytes!).equals(PNG_1X1)).toBe(true)
   })
 
   test('fetchAttachmentBytes returns null for unknown message', async () => {
-    expect(await fetchAttachmentBytes(bridgeUrl, 'NOPE', 0)).toBeNull()
+    expect(
+      await fetchAttachmentBytes(bridgeUrl, 'NOPE', 0, undefined, TEST_TOKEN),
+    ).toBeNull()
   })
 })
 
@@ -236,7 +258,7 @@ describe('materializeImage (remote)', () => {
         transfer_name: 'photo.png',
         is_image: true,
       },
-      source: { kind: 'remote', bridgeUrl },
+      source: { kind: 'remote', bridgeUrl, token: TEST_TOKEN },
       cacheDir,
     })
     expect(out).toBeDefined()
@@ -255,7 +277,7 @@ describe('materializeImage (remote)', () => {
         transfer_name: 'photo.heic',
         is_image: true,
       },
-      source: { kind: 'remote', bridgeUrl },
+      source: { kind: 'remote', bridgeUrl, token: TEST_TOKEN },
       cacheDir,
     })
     expect(out).toBeDefined()
@@ -295,8 +317,12 @@ describe('real fixture (opt-in)', () => {
     const url = `http://127.0.0.1:${port}`
     const proc = Bun.spawn(
       ['python3', path.join(import.meta.dir, 'bridge.py'), '--port', String(port),
-        '--db', testDb!, '--no-bonjour'],
-      { stdout: 'ignore', stderr: 'ignore' },
+        '--db', testDb!, '--no-bonjour', '--bind', '127.0.0.1'],
+      {
+        env: { ...process.env, IMESSAGE_BRIDGE_TOKEN_FILE: tokenFile },
+        stdout: 'ignore',
+        stderr: 'ignore',
+      },
     )
     try {
       await waitForBridge(url)
@@ -310,7 +336,7 @@ describe('real fixture (opt-in)', () => {
           transfer_name: 'IMG_3623.HEIC',
           is_image: true,
         },
-        source: { kind: 'remote', bridgeUrl: url },
+        source: { kind: 'remote', bridgeUrl: url, token: TEST_TOKEN },
         cacheDir: outDir,
       })
       expect(out).toBeDefined()

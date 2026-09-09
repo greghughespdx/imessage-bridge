@@ -11,6 +11,7 @@
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
+import { bridgeAuthHeaders } from './bridge-auth'
 
 export const DEFAULT_IMAGE_CACHE_DIR = path.join(
   os.homedir(),
@@ -27,7 +28,7 @@ export type AttachmentMeta = {
   mime_type: string | null
   transfer_name: string | null
   is_image: boolean
-  /** Set in local mode only — the file already lives on this host. */
+  /** Set in local mode only - the file already lives on this host. */
   localPath?: string
 }
 
@@ -76,12 +77,18 @@ export async function fetchAttachmentBytes(
   bridgeUrl: string,
   msgGuid: string,
   index: number,
-  timeoutMs = 15000,
+  timeoutMs: number | undefined = 15000,
+  token?: string,
 ): Promise<Uint8Array | null> {
   const url =
     `${bridgeUrl}/attachment?msg=${encodeURIComponent(msgGuid)}&index=${index}`
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
+    // Without the token header this is a 401, which lands in the !res.ok
+    // branch below as a null - same as any other fetch failure (mc-btl9u).
+    const res = await fetch(url, {
+      headers: bridgeAuthHeaders(token),
+      signal: AbortSignal.timeout(timeoutMs ?? 15000),
+    })
     if (!res.ok) return null
     return new Uint8Array(await res.arrayBuffer())
   } catch {
@@ -90,7 +97,12 @@ export async function fetchAttachmentBytes(
 }
 
 export type ImageSource =
-  | { kind: 'remote'; bridgeUrl: string }
+  /**
+   * `token` is the X-Bridge-Token shared secret (mc-btl9u). Omit it in
+   * production and it is read from IMESSAGE_BRIDGE_TOKEN_FILE; tests pass a
+   * throwaway value so they never touch a real token file.
+   */
+  | { kind: 'remote'; bridgeUrl: string; token?: string }
   | { kind: 'local' }
 
 export type MaterializeOpts = {
@@ -121,7 +133,13 @@ export async function materializeImage(
 
     let bytes: Uint8Array | null
     if (opts.source.kind === 'remote') {
-      bytes = await fetchAttachmentBytes(opts.source.bridgeUrl, guid, att.index)
+      bytes = await fetchAttachmentBytes(
+        opts.source.bridgeUrl,
+        guid,
+        att.index,
+        undefined,
+        opts.source.token,
+      )
       if (!bytes) {
         log(`attachment fetch failed for ${guid}#${att.index}`)
         return undefined
