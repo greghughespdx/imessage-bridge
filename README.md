@@ -8,7 +8,7 @@ Send and receive iMessages from anything that speaks HTTP. Zero dependencies, no
 
 While this package was designed to be used with [Claude Code's new (as of mid-March 2026) Channels](https://code.claude.com/docs/en/channels) feature to enable Claude AI assistants to send and receive iMessages, the HTTP API also works with anything that speaks the protocol: scripts, bots, home automation, and - of course - other AI tools and agents. 
 
-This system can send and receive text-based messages via iMessage (blue) and SMS if configured (green). Group chats are supported, too. Attachments/RCS/MMS are not supported.
+This system can send and receive text-based messages via iMessage (blue) and SMS if configured (green). Group chats are supported, too. Image attachments work in both directions: `GET /attachment` serves an inbound image out of the Messages attachment store, and `POST /send` takes an outbound image by host path or as base64 bytes. Non-image attachments, RCS and MMS are not supported.
 
 Side note: If you want to have a conversation with your agent when you're on CarPlay, iMessage is your best option. Otherwise, you're pretty much stuck with listen-only mode and unable to send Siri-dictated messages. Use the hands-free voice assistant, and pay 100% attention to the road and your surroundings. 
 
@@ -293,7 +293,7 @@ Returns the raw image bytes. Image attachments only, 50MB cap, and the resolved 
 GET /info
 ```
 
-Returns `{"name": "...", "hostname": "...", "port": 8432, "version": "0.1.0"}`.
+Returns `{"name": "...", "hostname": "...", "port": 8432, "version": "0.2.0"}`.
 
 ## Configuration
 

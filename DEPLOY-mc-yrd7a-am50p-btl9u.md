@@ -247,13 +247,15 @@ The TypeScript helper `remote-send.ts` mirrors both shapes as
 
 ## Tests
 
-- `python3 -m pytest` - 66 passed, 4 skipped (2 optional live-chat.db fixtures
-  in each of the two attachment suites).
+- `/usr/bin/python3 -m pytest` (Apple's 3.9.6, the interpreter family iMac27
+  runs) - 115 passed, 4 skipped (2 optional live-chat.db fixtures in each of
+  the two attachment suites). By file: 12 test_attachments.py, 27
+  test_attributed_body.py, 37 test_outbound_attachment.py, 39 test_auth.py.
 - `IMESSAGE_TEST_CHATDB=<copy> python3 -m pytest test_attributed_body.py` - adds
   the ground-truth pass: 5,363 rows carrying both `text` and `attributedBody`
   decoded to exactly their `text` column, 0 mismatches, 0 failures; all 274,095
   NULL-text rows decoded.
-- `bun test` - 32 passed, 1 skipped.
+- `bun test` - 34 passed, 1 skipped, across 3 files.
 
 ## Rollback with auth in the picture
 
