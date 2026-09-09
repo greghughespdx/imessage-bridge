@@ -1,0 +1,376 @@
+#!/usr/bin/env python3
+"""
+Tests for outbound image attachments on POST /send (mc-am50p).
+
+No test here runs osascript: send_message is replaced with a recorder so the
+suite never touches Messages.app or sends a real iMessage. The AppleScript that
+WOULD have run is asserted as text instead.
+
+Run: python3 -m pytest test_outbound_attachment.py
+"""
+
+import base64
+import http.client
+import json
+import os
+import sqlite3
+import stat
+import tempfile
+import threading
+import unittest
+from http.server import ThreadingHTTPServer
+
+import bridge
+
+
+# Smallest thing that is unambiguously a PNG by signature and extension. The
+# bridge does not parse image bytes, so content beyond this is irrelevant.
+PNG_BYTES = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+    b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+)
+
+MINIMAL_SCHEMA = """
+CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT);
+CREATE TABLE chat (ROWID INTEGER PRIMARY KEY, guid TEXT, style INTEGER);
+CREATE TABLE message (
+    ROWID INTEGER PRIMARY KEY, guid TEXT, text TEXT, attributedBody BLOB,
+    date INTEGER, is_from_me INTEGER, cache_has_attachments INTEGER DEFAULT 0,
+    handle_id INTEGER, service TEXT
+);
+CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);
+CREATE TABLE attachment (
+    ROWID INTEGER PRIMARY KEY, guid TEXT, filename TEXT, mime_type TEXT,
+    transfer_name TEXT, uti TEXT, total_bytes INTEGER
+);
+CREATE TABLE message_attachment_join (message_id INTEGER, attachment_id INTEGER);
+"""
+
+
+class BuildSendScriptTest(unittest.TestCase):
+    def test_text_only_script_has_no_posix_file_send(self):
+        script = bridge.build_send_script("iMessage;-;+15550001111", "hello", None)
+        self.assertIn('set targetChat to chat id "iMessage;-;+15550001111"', script)
+        self.assertIn('send "hello" to targetChat', script)
+        self.assertNotIn("POSIX file", script)
+
+    def test_attachment_follows_the_text(self):
+        script = bridge.build_send_script("chat-x", "look at this", "/tmp/pic.png")
+        lines = [line.strip() for line in script.splitlines()]
+        self.assertEqual(
+            lines,
+            [
+                'tell application "Messages"',
+                'set targetChat to chat id "chat-x"',
+                'send "look at this" to targetChat',
+                'send POSIX file "/tmp/pic.png" to targetChat',
+                "end tell",
+            ],
+        )
+
+    def test_attachment_alone_when_text_is_empty(self):
+        script = bridge.build_send_script("chat-x", "", "/tmp/pic.png")
+        self.assertNotIn("send \"\" to targetChat", script)
+        self.assertIn('send POSIX file "/tmp/pic.png" to targetChat', script)
+
+    def test_quotes_and_backslashes_in_the_path_are_escaped(self):
+        script = bridge.build_send_script("chat-x", "", '/tmp/a"b\\c.png')
+        self.assertIn('send POSIX file "/tmp/a\\"b\\\\c.png" to targetChat', script)
+
+
+class ValidateOutboundAttachmentTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mc-am50p-")
+        self.png = os.path.join(self.tmp, "pic.png")
+        with open(self.png, "wb") as f:
+            f.write(PNG_BYTES)
+
+    def test_accepts_an_absolute_image_path(self):
+        self.assertEqual(bridge.validate_outbound_attachment(self.png), self.png)
+
+    def test_accepts_heic_which_mimetypes_does_not_know(self):
+        heic = os.path.join(self.tmp, "shot.heic")
+        with open(heic, "wb") as f:
+            f.write(PNG_BYTES)
+        self.assertEqual(bridge.validate_outbound_attachment(heic), heic)
+
+    def test_rejects_a_relative_path(self):
+        with self.assertRaises(bridge.AttachmentRejected) as ctx:
+            bridge.validate_outbound_attachment("pic.png")
+        self.assertIn("absolute path", str(ctx.exception))
+
+    def test_rejects_a_missing_file(self):
+        with self.assertRaises(bridge.AttachmentRejected) as ctx:
+            bridge.validate_outbound_attachment(os.path.join(self.tmp, "gone.png"))
+        self.assertIn("not a file", str(ctx.exception))
+
+    def test_rejects_a_directory(self):
+        with self.assertRaises(bridge.AttachmentRejected):
+            bridge.validate_outbound_attachment(self.tmp)
+
+    def test_rejects_a_non_image(self):
+        doc = os.path.join(self.tmp, "secrets.txt")
+        with open(doc, "w") as f:
+            f.write("not a picture")
+        with self.assertRaises(bridge.AttachmentRejected) as ctx:
+            bridge.validate_outbound_attachment(doc)
+        self.assertIn("must be an image", str(ctx.exception))
+
+    def test_rejects_an_empty_file(self):
+        empty = os.path.join(self.tmp, "empty.png")
+        open(empty, "wb").close()
+        with self.assertRaises(bridge.AttachmentRejected) as ctx:
+            bridge.validate_outbound_attachment(empty)
+        self.assertIn("empty", str(ctx.exception))
+
+    def test_rejects_a_file_over_the_cap(self):
+        big = os.path.join(self.tmp, "big.png")
+        with open(big, "wb") as f:
+            f.truncate(bridge.MAX_ATTACHMENT_BYTES + 1)
+        with self.assertRaises(bridge.AttachmentRejected) as ctx:
+            bridge.validate_outbound_attachment(big)
+        self.assertIn("over the", str(ctx.exception))
+
+
+class StageOutboundAttachmentTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mc-am50p-outbox-")
+        self._orig_outbox = bridge.OUTBOX_DIR
+        bridge.OUTBOX_DIR = os.path.join(self.tmp, "outbox")
+
+    def tearDown(self):
+        bridge.OUTBOX_DIR = self._orig_outbox
+
+    def test_writes_a_0600_file_in_a_0700_dir(self):
+        staged = bridge.stage_outbound_attachment(
+            base64.b64encode(PNG_BYTES).decode("ascii"), "crop.png"
+        )
+        try:
+            self.assertTrue(os.path.isabs(staged))
+            self.assertTrue(staged.startswith(bridge.OUTBOX_DIR + os.sep))
+            with open(staged, "rb") as f:
+                self.assertEqual(f.read(), PNG_BYTES)
+            self.assertEqual(stat.S_IMODE(os.stat(staged).st_mode), 0o600)
+            self.assertEqual(
+                stat.S_IMODE(os.stat(bridge.OUTBOX_DIR).st_mode), 0o700
+            )
+        finally:
+            bridge.discard_staged_attachment(staged)
+
+    def test_staged_name_keeps_the_basename_only(self):
+        staged = bridge.stage_outbound_attachment(
+            base64.b64encode(PNG_BYTES).decode("ascii"), "../../evil.png"
+        )
+        try:
+            self.assertEqual(os.path.dirname(staged), bridge.OUTBOX_DIR)
+            self.assertTrue(os.path.basename(staged).endswith("-evil.png"))
+        finally:
+            bridge.discard_staged_attachment(staged)
+
+    def test_rejects_a_missing_name(self):
+        with self.assertRaises(bridge.AttachmentRejected) as ctx:
+            bridge.stage_outbound_attachment(
+                base64.b64encode(PNG_BYTES).decode("ascii"), None
+            )
+        self.assertIn("attachment_name is required", str(ctx.exception))
+
+    def test_rejects_a_non_image_name(self):
+        with self.assertRaises(bridge.AttachmentRejected) as ctx:
+            bridge.stage_outbound_attachment(
+                base64.b64encode(PNG_BYTES).decode("ascii"), "payload.sh"
+            )
+        self.assertIn("must be an image", str(ctx.exception))
+
+    def test_rejects_invalid_base64(self):
+        with self.assertRaises(bridge.AttachmentRejected) as ctx:
+            bridge.stage_outbound_attachment("not base64 !!!", "crop.png")
+        self.assertIn("not valid base64", str(ctx.exception))
+
+    def test_rejects_empty_bytes(self):
+        with self.assertRaises(bridge.AttachmentRejected) as ctx:
+            bridge.stage_outbound_attachment("", "crop.png")
+        self.assertIn("empty", str(ctx.exception))
+
+    def test_discard_tolerates_a_missing_file(self):
+        bridge.discard_staged_attachment(os.path.join(self.tmp, "never-existed.png"))
+        bridge.discard_staged_attachment(None)
+
+
+class SendRouteTest(unittest.TestCase):
+    """POST /send over a real loopback socket, with osascript stubbed out."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mc-am50p-http-")
+        self.db_path = os.path.join(self.tmp, "chat.db")
+        conn = sqlite3.connect(self.db_path)
+        conn.executescript(MINIMAL_SCHEMA)
+        conn.commit()
+        conn.close()
+
+        self.png = os.path.join(self.tmp, "pic.png")
+        with open(self.png, "wb") as f:
+            f.write(PNG_BYTES)
+
+        self._orig_outbox = bridge.OUTBOX_DIR
+        bridge.OUTBOX_DIR = os.path.join(self.tmp, "outbox")
+
+        # Record what would have been sent; never call osascript.
+        self.sends = []
+        self._orig_send = bridge.send_message
+        self._orig_probe = bridge.probe_outgoing_row
+
+        def fake_send(chat_id, text, attachment_path=None):
+            existed = bool(attachment_path) and os.path.isfile(attachment_path)
+            self.sends.append(
+                {
+                    "chat_id": chat_id,
+                    "text": text,
+                    "attachment_path": attachment_path,
+                    "attachment_existed_at_send": existed,
+                }
+            )
+            return 0.01
+
+        bridge.send_message = fake_send
+        bridge.probe_outgoing_row = lambda *a, **k: None
+
+        handler = bridge.make_handler(self.db_path)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        bridge.send_message = self._orig_send
+        bridge.probe_outgoing_row = self._orig_probe
+        bridge.OUTBOX_DIR = self._orig_outbox
+
+    def _post(self, payload):
+        raw = json.dumps(payload).encode("utf-8")
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request(
+            "POST", "/send", body=raw, headers={"Content-Type": "application/json"}
+        )
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        return resp.status, json.loads(body)
+
+    def test_text_only_send_is_unchanged(self):
+        status, body = self._post({"chat_id": "chat-x", "text": "hello"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "sent")
+        self.assertFalse(body["attachment_sent"])
+        self.assertEqual(self.sends[0]["attachment_path"], None)
+
+    def test_attachment_path_is_passed_through(self):
+        status, body = self._post(
+            {"chat_id": "chat-x", "text": "the mark", "attachment_path": self.png}
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["attachment_sent"])
+        self.assertEqual(self.sends[0]["attachment_path"], self.png)
+        self.assertEqual(self.sends[0]["text"], "the mark")
+        # A caller-supplied host path is never deleted by the bridge.
+        self.assertTrue(os.path.isfile(self.png))
+
+    def test_attachment_b64_is_staged_then_deleted(self):
+        status, body = self._post(
+            {
+                "chat_id": "chat-x",
+                "text": "",
+                "attachment_b64": base64.b64encode(PNG_BYTES).decode("ascii"),
+                "attachment_name": "crop.png",
+            }
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(body["attachment_sent"])
+        staged = self.sends[0]["attachment_path"]
+        self.assertTrue(self.sends[0]["attachment_existed_at_send"])
+        self.assertFalse(os.path.exists(staged), "staged file outlived the send")
+        self.assertEqual(os.listdir(bridge.OUTBOX_DIR), [])
+
+    def test_attachment_alone_with_no_text_field(self):
+        status, body = self._post(
+            {"chat_id": "chat-x", "attachment_path": self.png}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(self.sends[0]["text"], "")
+
+    def test_staged_file_is_deleted_when_the_send_fails(self):
+        def failing_send(chat_id, text, attachment_path=None):
+            self.sends.append({"attachment_path": attachment_path})
+            raise RuntimeError("AppleScript failed (exit 1): boom")
+
+        bridge.send_message = failing_send
+        status, body = self._post(
+            {
+                "chat_id": "chat-x",
+                "text": "x",
+                "attachment_b64": base64.b64encode(PNG_BYTES).decode("ascii"),
+                "attachment_name": "crop.png",
+            }
+        )
+        self.assertEqual(status, 500)
+        self.assertFalse(os.path.exists(self.sends[0]["attachment_path"]))
+
+    def test_both_attachment_forms_is_a_400(self):
+        status, body = self._post(
+            {
+                "chat_id": "chat-x",
+                "text": "x",
+                "attachment_path": self.png,
+                "attachment_b64": base64.b64encode(PNG_BYTES).decode("ascii"),
+                "attachment_name": "crop.png",
+            }
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("not both", body["error"])
+        self.assertEqual(self.sends, [])
+
+    def test_missing_text_with_no_attachment_is_still_a_400(self):
+        status, body = self._post({"chat_id": "chat-x"})
+        self.assertEqual(status, 400)
+        self.assertIn("Missing required field: text", body["error"])
+
+    def test_empty_text_with_no_attachment_is_a_400(self):
+        status, body = self._post({"chat_id": "chat-x", "text": ""})
+        self.assertEqual(status, 400)
+        self.assertIn("Nothing to send", body["error"])
+        self.assertEqual(self.sends, [])
+
+    def test_relative_attachment_path_is_a_400(self):
+        status, body = self._post(
+            {"chat_id": "chat-x", "text": "x", "attachment_path": "pic.png"}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("absolute path", body["error"])
+        self.assertEqual(self.sends, [])
+
+    def test_non_image_attachment_path_is_a_400(self):
+        doc = os.path.join(self.tmp, "notes.txt")
+        with open(doc, "w") as f:
+            f.write("text")
+        status, body = self._post(
+            {"chat_id": "chat-x", "text": "x", "attachment_path": doc}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("must be an image", body["error"])
+
+    def test_bad_base64_is_a_400(self):
+        status, body = self._post(
+            {
+                "chat_id": "chat-x",
+                "text": "x",
+                "attachment_b64": "!!! not base64 !!!",
+                "attachment_name": "crop.png",
+            }
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("not valid base64", body["error"])
+
+
+if __name__ == "__main__":
+    unittest.main()

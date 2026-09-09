@@ -8,9 +8,12 @@ Usage:
 """
 
 import argparse
+import base64
+import binascii
 import json
 import logging
 import logging.handlers
+import mimetypes
 import os
 import platform
 import socket
@@ -19,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -77,6 +81,123 @@ IMAGE_UTIS = {"public.heic", "public.heif", "public.jpeg", "public.png"}
 # Cap a single attachment fetch. Real photos are a few MB; this guards against a
 # pathological row pointing at something huge.
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+
+# ---------------------------------------------------------------------------
+# Outbound image attachments (mc-am50p)
+#
+# POST /send takes an optional image, either as attachment_path (a path already
+# on this host) or attachment_b64 + attachment_name (bytes the caller supplies,
+# staged here). Staged bytes land in a 0700 directory as a 0600 file and are
+# deleted once osascript returns, success or failure.
+# ---------------------------------------------------------------------------
+
+# Where attachment_b64 uploads are staged. Kept under the user's home rather
+# than the system temp dir because Messages.app has to be able to read the file
+# it is told to send.
+OUTBOX_DIR = os.path.realpath(
+    os.path.expanduser(
+        os.environ.get("IMESSAGE_BRIDGE_OUTBOX_DIR", "~/.imessage-bridge/outbox")
+    )
+)
+
+# Outbound is images only, matching the inbound rule ("Only image attachments
+# are served"). mimetypes on Apple's 3.9 does not know HEIC, so the extension
+# set carries the formats it misses.
+OUTBOUND_IMAGE_EXTENSIONS = {
+    ".bmp", ".gif", ".heic", ".heif", ".jpeg", ".jpg", ".png", ".tif",
+    ".tiff", ".webp",
+}
+
+
+class AttachmentRejected(Exception):
+    """Caller-supplied attachment failed validation. Maps to HTTP 400."""
+
+
+def _looks_like_image(path: str) -> bool:
+    ext = os.path.splitext(path)[1].lower()
+    if ext in OUTBOUND_IMAGE_EXTENSIONS:
+        return True
+    guessed = mimetypes.guess_type(path)[0]
+    return bool(guessed and guessed.startswith(IMAGE_MIME_PREFIX))
+
+
+def validate_outbound_attachment(path: str) -> str:
+    """Check a host path is a sendable image. Returns the path unchanged.
+
+    Raises AttachmentRejected with a caller-safe reason.
+    """
+    if not os.path.isabs(path):
+        raise AttachmentRejected("attachment_path must be an absolute path")
+    if not os.path.isfile(path):
+        raise AttachmentRejected("attachment_path is not a file on the bridge host")
+    if not _looks_like_image(path):
+        raise AttachmentRejected("attachment must be an image")
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        raise AttachmentRejected("cannot stat attachment: %s" % e)
+    if size > MAX_ATTACHMENT_BYTES:
+        raise AttachmentRejected(
+            "attachment is %d bytes, over the %d byte cap"
+            % (size, MAX_ATTACHMENT_BYTES)
+        )
+    if size == 0:
+        raise AttachmentRejected("attachment is empty")
+    return path
+
+
+def stage_outbound_attachment(b64_data: str, name: str) -> str:
+    """Write base64 attachment bytes to a 0600 file under OUTBOX_DIR.
+
+    Returns the absolute staged path. The caller owns deleting it.
+    """
+    if not isinstance(b64_data, str):
+        raise AttachmentRejected("attachment_b64 must be a string")
+    if not isinstance(name, str) or not name.strip():
+        raise AttachmentRejected("attachment_name is required with attachment_b64")
+
+    safe_name = os.path.basename(name.strip()).replace("\x00", "")
+    if not safe_name or safe_name in (".", ".."):
+        raise AttachmentRejected("attachment_name is not a usable file name")
+    if not _looks_like_image(safe_name):
+        raise AttachmentRejected("attachment must be an image")
+
+    try:
+        raw = base64.b64decode(b64_data, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise AttachmentRejected("attachment_b64 is not valid base64: %s" % e)
+    if not raw:
+        raise AttachmentRejected("attachment is empty")
+    if len(raw) > MAX_ATTACHMENT_BYTES:
+        raise AttachmentRejected(
+            "attachment is %d bytes, over the %d byte cap"
+            % (len(raw), MAX_ATTACHMENT_BYTES)
+        )
+
+    try:
+        os.makedirs(OUTBOX_DIR, mode=0o700, exist_ok=True)
+    except OSError as e:
+        raise RuntimeError("cannot create outbox dir %s: %s" % (OUTBOX_DIR, e))
+
+    staged = os.path.join(OUTBOX_DIR, "%s-%s" % (uuid.uuid4().hex, safe_name))
+    fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+    except OSError:
+        discard_staged_attachment(staged)
+        raise
+    return staged
+
+
+def discard_staged_attachment(path) -> None:
+    """Best-effort delete of a staged attachment. Never raises."""
+    if not path:
+        return
+    try:
+        os.unlink(path)
+    except OSError as e:
+        log.warning("could not delete staged attachment %s: %s", path, e)
 
 
 def _expand_attachment_path(raw: str) -> str:
@@ -439,20 +560,37 @@ def get_messages(db_path: str, after_unix_ms: int) -> list:
     return messages
 
 
-def send_message(chat_id: str, text: str) -> float:
+def build_send_script(chat_id: str, text: str, attachment_path=None) -> str:
+    """Build the AppleScript for one send.
+
+    Text goes first, then the attachment as a second send to the same chat, so
+    the picture arrives under the sentence that explains it (mc-am50p). Either
+    half may be omitted; the caller guarantees at least one is present.
+    """
+    escaped_chat_id = escape_applescript_string(chat_id)
+    lines = [
+        'tell application "Messages"',
+        f'    set targetChat to chat id "{escaped_chat_id}"',
+    ]
+    if text:
+        lines.append(f'    send "{escape_applescript_string(text)}" to targetChat')
+    if attachment_path:
+        escaped_path = escape_applescript_string(attachment_path)
+        lines.append(f'    send POSIX file "{escaped_path}" to targetChat')
+    lines.append("end tell")
+    return "\n".join(lines)
+
+
+def send_message(chat_id: str, text: str, attachment_path=None) -> float:
     """
     Send an iMessage via AppleScript.
     chat_id should be a full chat GUID like 'iMessage;-;+15034102254'.
+    attachment_path, when given, is an absolute path on THIS host that already
+    passed validate_outbound_attachment; it is sent after the text.
     Returns the AppleScript elapsed time in seconds. Logs per-send timing and
     the osascript exit/stderr detail (mc-lkbx diagnostics).
     """
-    escaped_text = escape_applescript_string(text)
-    escaped_chat_id = escape_applescript_string(chat_id)
-
-    script = (
-        f'tell application "Messages" to send "{escaped_text}" '
-        f'to chat id "{escaped_chat_id}"'
-    )
+    script = build_send_script(chat_id, text, attachment_path)
 
     t0 = time.monotonic()
     result = subprocess.run(
@@ -478,7 +616,10 @@ def send_message(chat_id: str, text: str) -> float:
     with _SEND_STATS_LOCK:
         SEND_STATS["sent"] += 1
         SEND_STATS["last_send_at"] = time.time()
-    log.info("send ok chat=%s elapsed=%.2fs text_len=%d", chat_id, elapsed, len(text))
+    log.info(
+        "send ok chat=%s elapsed=%.2fs text_len=%d attachment=%s",
+        chat_id, elapsed, len(text), bool(attachment_path),
+    )
     return elapsed
 
 
@@ -697,20 +838,60 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
         chat_id = body.get("chat_id")
         text = body.get("text")
+        attachment_path = body.get("attachment_path")
+        attachment_b64 = body.get("attachment_b64")
+        attachment_name = body.get("attachment_name")
 
         if not chat_id:
             self.send_error_json(400, "Missing required field: chat_id")
             return
-        if text is None:
-            self.send_error_json(400, "Missing required field: text")
+        if attachment_path is not None and attachment_b64 is not None:
+            self.send_error_json(
+                400, "Pass attachment_path or attachment_b64, not both"
+            )
             return
+
+        has_attachment = attachment_path is not None or attachment_b64 is not None
+        # text stays required unless an attachment carries the message, so an
+        # existing text-only caller still gets the old 400 on a missing field.
+        if text is None:
+            if not has_attachment:
+                self.send_error_json(400, "Missing required field: text")
+                return
+            text = ""
         if not isinstance(text, str):
             self.send_error_json(400, "Field 'text' must be a string")
+            return
+        if not text and not has_attachment:
+            self.send_error_json(400, "Nothing to send: text is empty and no attachment")
+            return
+
+        # Staged bytes get deleted once osascript returns, success or failure.
+        staged_path = None
+        try:
+            if attachment_b64 is not None:
+                staged_path = stage_outbound_attachment(
+                    attachment_b64, attachment_name
+                )
+                send_path = staged_path
+            elif attachment_path is not None:
+                if not isinstance(attachment_path, str):
+                    raise AttachmentRejected("Field 'attachment_path' must be a string")
+                send_path = validate_outbound_attachment(attachment_path)
+            else:
+                send_path = None
+        except AttachmentRejected as e:
+            self.send_error_json(400, str(e))
+            return
+        except (OSError, RuntimeError) as e:
+            log.error("staging attachment failed chat=%s: %s", chat_id, e)
+            discard_staged_attachment(staged_path)
+            self.send_error_json(500, "Cannot stage attachment")
             return
 
         sent_at_ms = int(time.time() * 1000) - 2000  # 2s slack for clock/db skew
         try:
-            elapsed = send_message(chat_id, str(text))
+            elapsed = send_message(chat_id, str(text), send_path)
         except subprocess.TimeoutExpired:
             with _SEND_STATS_LOCK:
                 SEND_STATS["failed"] += 1
@@ -721,9 +902,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
         except RuntimeError as e:
             self.send_error_json(500, str(e))
             return
+        finally:
+            discard_staged_attachment(staged_path)
 
         probe_outgoing_row(self.db_path, chat_id, sent_at_ms)
-        self.send_json(200, {"status": "sent", "applescript_elapsed_s": round(elapsed, 2)})
+        self.send_json(200, {
+            "status": "sent",
+            "applescript_elapsed_s": round(elapsed, 2),
+            "attachment_sent": send_path is not None,
+        })
 
 
 def make_handler(db_path: str):
