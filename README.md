@@ -311,7 +311,7 @@ The installer also reads `IMESSAGE_BRIDGE_PORT` and `IMESSAGE_BRIDGE_NAME` envir
 |----------------------|---------|-------------|
 | `IMESSAGE_BRIDGE_LOG` | /usr/local/var/log/imessage-bridge-app.log | Rotating application log |
 | `IMESSAGE_BRIDGE_TOKEN_FILE` | ~/.config/imessage-bridge/token | Shared secret for the `X-Bridge-Token` header. Must be `0600`. Read by the bridge AND by every client. |
-| `IMESSAGE_BRIDGE_OUTBOX_DIR` | ~/.imessage-bridge/outbox | Where `attachment_b64` uploads are staged before sending. Created `0700`; files are `0600` and deleted after the send. Messages.app must be able to read this path. |
+| `IMESSAGE_BRIDGE_OUTBOX_DIR` | ~/.imessage-bridge/outbox | Where `attachment_b64` uploads are staged before sending. Files are `0600` and deleted after the send. Messages.app must be able to read this path. The directory is checked on every staged send, not only when it is created: it must be a directory owned by the bridge's own user (anything else is refused with an error), and any group or world bits are chmod'ed away to `0700` first, with a warning in the log naming the old mode. |
 | `IMESSAGE_ATTACHMENTS_DIR` | ~/Library/Messages/Attachments | Base directory inbound attachments must live under |
 
 ## Multiple bridges on one network

@@ -395,10 +395,7 @@ def stage_outbound_attachment(b64_data: str, name: str) -> str:
             % (len(raw), MAX_ATTACHMENT_BYTES)
         )
 
-    try:
-        os.makedirs(OUTBOX_DIR, mode=0o700, exist_ok=True)
-    except OSError as e:
-        raise RuntimeError("cannot create outbox dir %s: %s" % (OUTBOX_DIR, e))
+    ensure_private_outbox_dir(OUTBOX_DIR)
 
     staged = os.path.join(OUTBOX_DIR, "%s-%s" % (uuid.uuid4().hex, safe_name))
     fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -409,6 +406,57 @@ def stage_outbound_attachment(b64_data: str, name: str) -> str:
         discard_staged_attachment(staged)
         raise
     return staged
+
+
+def ensure_private_outbox_dir(path) -> None:
+    """Create the outbox and make sure it really is ours and really is 0700.
+
+    finding 5: `os.makedirs(mode=0o700, exist_ok=True)` applies the mode only
+    when it creates the directory. An outbox that already exists as 0755 - a
+    leftover, an untarred backup, a directory someone made by hand - stays
+    0755, and every user on that Mac can list and read the images staged in it
+    while a send is in flight.
+
+    So we look after creating, and we tighten:
+
+    - not a directory, or owned by another uid: refuse. Staging Greg's images
+      into someone else's directory is not a permissions problem to fix
+      quietly, it is a reason to stop.
+    - group or world bits set: chmod 0700, then re-stat and confirm. Chosen
+      over refusing because the fix is unambiguous, safe, and the alternative
+      is a bridge that will not send until someone SSHes in.
+    """
+    try:
+        os.makedirs(path, mode=0o700, exist_ok=True)
+    except OSError as e:
+        raise RuntimeError("cannot create outbox dir %s: %s" % (path, e))
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        raise RuntimeError("cannot stat outbox dir %s: %s" % (path, e))
+    if not stat.S_ISDIR(st.st_mode):
+        raise RuntimeError("outbox path %s is not a directory" % path)
+    if st.st_uid != os.getuid():
+        raise RuntimeError(
+            "outbox dir %s is owned by uid %d, not by the bridge (uid %d); "
+            "refusing to stage attachments there" % (path, st.st_uid, os.getuid())
+        )
+    was = stat.S_IMODE(st.st_mode)
+    if was & 0o077:
+        try:
+            os.chmod(path, 0o700)
+        except OSError as e:
+            raise RuntimeError(
+                "outbox dir %s is mode %o and cannot be tightened to 700: %s"
+                % (path, was, e)
+            )
+        now = stat.S_IMODE(os.stat(path).st_mode)
+        if now & 0o077:
+            raise RuntimeError(
+                "outbox dir %s is still group or world accessible (mode %o) "
+                "after chmod 700" % (path, now)
+            )
+        log.warning("outbox dir %s was mode %o; tightened to 700", path, was)
 
 
 def discard_staged_attachment(path) -> None:

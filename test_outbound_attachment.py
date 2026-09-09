@@ -232,6 +232,44 @@ class StageOutboundAttachmentTest(unittest.TestCase):
         finally:
             bridge.discard_staged_attachment(staged)
 
+    def test_a_pre_existing_0755_outbox_is_tightened_before_anything_is_staged(self):
+        # finding 5: os.makedirs(mode=0o700, exist_ok=True) does nothing at all
+        # to a directory that already exists, so a 0755 outbox stayed 0755 and
+        # every user on the Mac could read the images staged in it.
+        os.makedirs(bridge.OUTBOX_DIR, mode=0o755)
+        os.chmod(bridge.OUTBOX_DIR, 0o755)  # umask-proof
+        self.assertEqual(stat.S_IMODE(os.stat(bridge.OUTBOX_DIR).st_mode), 0o755)
+
+        staged = bridge.stage_outbound_attachment(
+            base64.b64encode(PNG_BYTES).decode("ascii"), "crop.png"
+        )
+        try:
+            self.assertEqual(
+                stat.S_IMODE(os.stat(bridge.OUTBOX_DIR).st_mode), 0o700
+            )
+            self.assertEqual(stat.S_IMODE(os.stat(staged).st_mode), 0o600)
+        finally:
+            bridge.discard_staged_attachment(staged)
+
+    def test_a_pre_existing_0777_outbox_is_tightened_too(self):
+        os.makedirs(bridge.OUTBOX_DIR)
+        os.chmod(bridge.OUTBOX_DIR, 0o777)
+        bridge.ensure_private_outbox_dir(bridge.OUTBOX_DIR)
+        self.assertEqual(stat.S_IMODE(os.stat(bridge.OUTBOX_DIR).st_mode), 0o700)
+
+    def test_an_outbox_that_is_a_file_is_refused(self):
+        with open(bridge.OUTBOX_DIR, "w") as f:
+            f.write("not a directory")
+        with self.assertRaises(RuntimeError) as ctx:
+            bridge.ensure_private_outbox_dir(bridge.OUTBOX_DIR)
+        self.assertIn(bridge.OUTBOX_DIR, str(ctx.exception))
+
+    def test_an_outbox_owned_by_another_uid_is_refused(self):
+        # /tmp is root-owned and 1777. Nothing is written to it here.
+        with self.assertRaises(RuntimeError) as ctx:
+            bridge.ensure_private_outbox_dir("/tmp")
+        self.assertIn("not by the bridge", str(ctx.exception))
+
     def test_staged_name_keeps_the_basename_only(self):
         staged = bridge.stage_outbound_attachment(
             base64.b64encode(PNG_BYTES).decode("ascii"), "../../evil.png"
