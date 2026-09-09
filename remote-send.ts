@@ -3,13 +3,46 @@ export type FetchImpl = (
   init?: RequestInit,
 ) => Promise<Response>
 
+/**
+ * An optional image to send alongside the text (mc-am50p). Two shapes, matching
+ * the bridge's POST /send:
+ *
+ *   { path }                 an absolute path on the BRIDGE host, not on this
+ *                            machine. Only use it when the caller knows the two
+ *                            are the same box or share the path.
+ *   { base64, name }         the bytes themselves; the bridge stages them in a
+ *                            0600 temp file and deletes it after the send. This
+ *                            is the shape a remote caller wants.
+ */
+export type RemoteAttachment =
+  | { path: string; base64?: never; name?: never }
+  | { base64: string; name: string; path?: never }
+
 export type RemoteSendOptions = {
+  attachment?: RemoteAttachment
   attempts?: number
   fetchImpl?: FetchImpl
   probeBeforeSend?: boolean
   retryDelayMs?: number
   timeoutMs?: number
   log?: (message: string) => void
+}
+
+/** Build the POST /send body, omitting attachment fields when there is none. */
+function sendPayload(
+  chatId: string,
+  text: string,
+  attachment?: RemoteAttachment,
+): Record<string, string> {
+  const payload: Record<string, string> = { chat_id: chatId, text }
+  if (!attachment) return payload
+  if (attachment.path !== undefined) {
+    payload.attachment_path = attachment.path
+  } else {
+    payload.attachment_b64 = attachment.base64
+    payload.attachment_name = attachment.name
+  }
+  return payload
 }
 
 const DEFAULT_ATTEMPTS = 2
@@ -60,7 +93,7 @@ export async function postRemoteMessage(
   bridgeUrl: string,
   chatId: string,
   text: string,
-  options: Pick<RemoteSendOptions, 'fetchImpl' | 'timeoutMs'> = {},
+  options: Pick<RemoteSendOptions, 'attachment' | 'fetchImpl' | 'timeoutMs'> = {},
 ): Promise<void> {
   const fetchImpl = options.fetchImpl ?? fetch
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
@@ -71,7 +104,7 @@ export async function postRemoteMessage(
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId, text }),
+        body: JSON.stringify(sendPayload(chatId, text, options.attachment)),
       },
       timeoutMs,
     ),

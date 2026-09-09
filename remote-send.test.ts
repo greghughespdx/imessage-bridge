@@ -127,6 +127,78 @@ describe('sendRemoteWithKeepalive', () => {
     })
   })
 
+  test('sends a staged image as attachment_b64 plus attachment_name', async () => {
+    const { calls, fetchImpl } = makeFetch(call => {
+      if (call.url.endsWith('/info')) return new Response('{}', { status: 200 })
+      return new Response('{"status":"sent","attachment_sent":true}', { status: 200 })
+    })
+
+    await sendRemoteWithKeepalive('http://bridge.local:8432', 'chat-id', 'the mark', {
+      attachment: { base64: 'aW1hZ2UtYnl0ZXM=', name: 'crop.png' },
+      fetchImpl,
+      retryDelayMs: 0,
+    })
+
+    expect(JSON.parse(calls[1].body ?? '{}')).toEqual({
+      chat_id: 'chat-id',
+      text: 'the mark',
+      attachment_b64: 'aW1hZ2UtYnl0ZXM=',
+      attachment_name: 'crop.png',
+    })
+  })
+
+  test('sends a bridge-host path as attachment_path', async () => {
+    const { calls, fetchImpl } = makeFetch(call => {
+      if (call.url.endsWith('/info')) return new Response('{}', { status: 200 })
+      return new Response('{"status":"sent","attachment_sent":true}', { status: 200 })
+    })
+
+    await sendRemoteWithKeepalive('http://bridge.local:8432', 'chat-id', '', {
+      attachment: { path: '/Users/someone/crop.png' },
+      fetchImpl,
+      retryDelayMs: 0,
+    })
+
+    expect(JSON.parse(calls[1].body ?? '{}')).toEqual({
+      chat_id: 'chat-id',
+      text: '',
+      attachment_path: '/Users/someone/crop.png',
+    })
+  })
+
+  test('omits the attachment fields entirely when there is no attachment', async () => {
+    const { calls, fetchImpl } = makeFetch(call => {
+      if (call.url.endsWith('/info')) return new Response('{}', { status: 200 })
+      return new Response('{"status":"sent"}', { status: 200 })
+    })
+
+    await sendRemoteWithKeepalive('http://bridge.local:8432', 'chat-id', 'hello', {
+      fetchImpl,
+      retryDelayMs: 0,
+    })
+
+    const body = JSON.parse(calls[1].body ?? '{}')
+    expect(Object.keys(body).sort()).toEqual(['chat_id', 'text'])
+  })
+
+  test('carries the attachment through a retry', async () => {
+    const { calls, fetchImpl } = makeFetch(call => {
+      if (call.url.endsWith('/send') && calls.length === 2) {
+        return new Error('connection reset by peer')
+      }
+      if (call.url.endsWith('/info')) return new Response('{}', { status: 200 })
+      return new Response('{"status":"sent","attachment_sent":true}', { status: 200 })
+    })
+
+    await sendRemoteWithKeepalive('http://bridge.local:8432', 'chat-id', 'the mark', {
+      attachment: { base64: 'aW1hZ2UtYnl0ZXM=', name: 'crop.png' },
+      fetchImpl,
+      retryDelayMs: 0,
+    })
+
+    expect(JSON.parse(calls[3].body ?? '{}').attachment_name).toBe('crop.png')
+  })
+
   test('reports the final bridge response when all send attempts fail', async () => {
     const { fetchImpl } = makeFetch(call => {
       if (call.url.endsWith('/info')) return new Response('{}', { status: 200 })
