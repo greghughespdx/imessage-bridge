@@ -823,9 +823,19 @@ def send_message(chat_id: str, text: str, attachment_path=None) -> float:
     """
     script = build_send_script(chat_id, text, attachment_path)
 
+    # The script goes in on STDIN, not as argv (finding 3). With `-e` the whole
+    # script - the message body, and with mc-am50p the host path of the image -
+    # sat in the process list, readable by `ps` for every user on the Mac for
+    # as long as the send took. osascript with no programfile argument reads
+    # the script from stdin, which no other process can see.
+    #
+    # The script TEXT is unchanged: build_send_script still returns the exact
+    # bytes master 3ce9c66 sent for a text-only send. Only the delivery
+    # channel into osascript moved.
     t0 = time.monotonic()
     result = subprocess.run(
-        ["osascript", "-e", script],
+        ["osascript"],
+        input=script,
         capture_output=True,
         text=True,
         timeout=60,

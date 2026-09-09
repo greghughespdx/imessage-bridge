@@ -86,6 +86,73 @@ class BuildSendScriptTest(unittest.TestCase):
         self.assertIn('send POSIX file "/tmp/a\\"b\\\\c.png" to targetChat', script)
 
 
+class SendMessageArgvTest(unittest.TestCase):
+    """finding 3: the whole AppleScript used to be argv entry 3 of osascript.
+
+    That put the message body - and, with mc-am50p, the host path of the image
+    - in the process list, readable by `ps` for every user on that Mac for as
+    long as the send took. It now goes in on stdin, which no other process can
+    read. subprocess.run is replaced with a recorder, so nothing here executes
+    osascript or sends anything.
+    """
+
+    CHAT = "iMessage;-;+15550001111"
+    SECRET_BODY = "body-that-must-never-reach-the-process-list"
+    SECRET_PATH = "/Users/greg/private-crop-that-must-not-reach-ps.png"
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def setUp(self):
+        self.calls = []
+        self._orig_run = bridge.subprocess.run
+
+        def fake_run(argv, **kwargs):
+            self.calls.append((list(argv), dict(kwargs)))
+            return self._Result()
+
+        bridge.subprocess.run = fake_run
+
+    def tearDown(self):
+        bridge.subprocess.run = self._orig_run
+
+    def _send(self, text, attachment):
+        bridge.send_message(self.CHAT, text, attachment)
+        self.assertEqual(len(self.calls), 1)
+        return self.calls[0]
+
+    def test_argv_carries_neither_the_body_nor_the_attachment_path(self):
+        argv, _ = self._send(self.SECRET_BODY, self.SECRET_PATH)
+        joined = " ".join(argv)
+        self.assertNotIn(self.SECRET_BODY, joined)
+        self.assertNotIn(self.SECRET_PATH, joined)
+        self.assertNotIn("-e", argv)
+        self.assertEqual(argv[0], "osascript")
+
+    def test_stdin_carries_the_intended_script(self):
+        _, kwargs = self._send(self.SECRET_BODY, self.SECRET_PATH)
+        self.assertEqual(
+            kwargs.get("input"),
+            bridge.build_send_script(self.CHAT, self.SECRET_BODY, self.SECRET_PATH),
+        )
+        self.assertIn(self.SECRET_BODY, kwargs["input"])
+        self.assertIn(self.SECRET_PATH, kwargs["input"])
+        self.assertTrue(kwargs.get("text"))
+
+    def test_the_text_only_script_reaches_stdin_byte_identical(self):
+        # Same guarantee as BuildSendScriptTest, asserted at the boundary that
+        # actually feeds osascript.
+        argv, kwargs = self._send("hello", None)
+        self.assertNotIn("hello", " ".join(argv))
+        self.assertEqual(
+            kwargs.get("input"),
+            'tell application "Messages" to send "hello" '
+            'to chat id "iMessage;-;+15550001111"',
+        )
+
+
 class ValidateOutboundAttachmentTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="mc-am50p-")
