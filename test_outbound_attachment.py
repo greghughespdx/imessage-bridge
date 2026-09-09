@@ -48,10 +48,15 @@ CREATE TABLE message_attachment_join (message_id INTEGER, attachment_id INTEGER)
 
 
 class BuildSendScriptTest(unittest.TestCase):
-    def test_text_only_script_has_no_posix_file_send(self):
+    def test_text_only_script_is_the_unchanged_one_liner(self):
+        # The live text path must not change shape. This is exactly what
+        # master (3ce9c66) sent, and what iMac27 runs today.
         script = bridge.build_send_script("iMessage;-;+15550001111", "hello", None)
-        self.assertIn('set targetChat to chat id "iMessage;-;+15550001111"', script)
-        self.assertIn('send "hello" to targetChat', script)
+        self.assertEqual(
+            script,
+            'tell application "Messages" to send "hello" '
+            'to chat id "iMessage;-;+15550001111"',
+        )
         self.assertNotIn("POSIX file", script)
 
     def test_attachment_follows_the_text(self):

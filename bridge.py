@@ -568,15 +568,25 @@ def build_send_script(chat_id: str, text: str, attachment_path=None) -> str:
     half may be omitted; the caller guarantees at least one is present.
     """
     escaped_chat_id = escape_applescript_string(chat_id)
+
+    # No attachment: emit the exact one-liner that has been running on iMac27
+    # since 0.1.0. The text path Greg depends on stays byte-for-byte what it
+    # was; the tell-block below is reached only when an image is involved.
+    if not attachment_path:
+        escaped_text = escape_applescript_string(text)
+        return (
+            f'tell application "Messages" to send "{escaped_text}" '
+            f'to chat id "{escaped_chat_id}"'
+        )
+
     lines = [
         'tell application "Messages"',
         f'    set targetChat to chat id "{escaped_chat_id}"',
     ]
     if text:
         lines.append(f'    send "{escape_applescript_string(text)}" to targetChat')
-    if attachment_path:
-        escaped_path = escape_applescript_string(attachment_path)
-        lines.append(f'    send POSIX file "{escaped_path}" to targetChat')
+    escaped_path = escape_applescript_string(attachment_path)
+    lines.append(f'    send POSIX file "{escaped_path}" to targetChat')
     lines.append("end tell")
     return "\n".join(lines)
 
