@@ -235,9 +235,10 @@ def detect_lan_ipv4() -> str:
 
 
 def canonical_bind_address(requested: str) -> str:
-    """Canonical text form of one bindable IP literal.
+    """Canonical text form of one bindable IPv4 literal.
 
-    Raises ValueError for anything that is not an IP literal, and for every
+    Raises ValueError for anything that is not an IPv4 literal (IPv6 included,
+    the server is IPv4-only), and for every
     spelling of the unspecified address.
 
     Why parsing and not a string set: `socket.bind` hands the string to
@@ -248,12 +249,15 @@ def canonical_bind_address(requested: str) -> str:
     """
     text = requested.strip()
     try:
-        addr = ipaddress.ip_address(text)
+        # IPv4Address, not ip_address: the server is an IPv4
+        # ThreadingHTTPServer (AF_INET), so an IPv6 literal such as ::1 would
+        # pass validation and then fail at socket creation. Refuse it here.
+        addr = ipaddress.IPv4Address(text)
     except ValueError:
         raise ValueError(
-            "--bind %r is not an IP address literal. Name one address (for "
-            "example 192.168.15.12), or omit --bind to use this host's LAN "
-            "IPv4." % requested
+            "--bind %r is not an IPv4 address literal. Name one IPv4 address "
+            "(for example 192.168.15.12), or omit --bind to use this host's "
+            "LAN IPv4." % requested
         )
     if addr.is_unspecified:
         raise ValueError(
@@ -1313,7 +1317,7 @@ def main():
         default=None,
         help=(
             "Address to listen on (default: this host's LAN IPv4, or 127.0.0.1 "
-            "if there is none). Must be an IP address literal; every spelling "
+            "if there is none). Must be an IPv4 address literal; every spelling "
             "of the unspecified address (0.0.0.0, ::, 0, 0x0) is refused."
         ),
     )

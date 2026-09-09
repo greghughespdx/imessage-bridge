@@ -219,7 +219,7 @@ readability - run each one through `bridge_curl` rather than adding `-H`.
 
 The bridge binds **one** address, never `0.0.0.0`. By default it resolves this
 host's LAN IPv4 and binds that, falling back to `127.0.0.1` when there is no LAN
-address. `--bind <address>` overrides it and must be an IP address literal; it
+address. `--bind <address>` overrides it and must be an IPv4 address literal (the server is IPv4-only); it
 is parsed with Python's `ipaddress` module, so every spelling of the unspecified
 address (`0.0.0.0`, `::`, and also `0`, `00`, `00000000`, `0x0`, all of which
 getaddrinfo resolves to 0.0.0.0) is refused at startup rather than silently
@@ -377,7 +377,7 @@ The channel server found a local chat.db before checking for a remote bridge. Se
 
 **Bridge is not discoverable via Bonjour**
 
-Check that the bridge is running: `bridge_curl http://localhost:8432/info` (the wrapper from "Authentication" above; a bare curl gets a `401`, which means the bridge is up and you forgot the header). If it responds, the bridge is up but Bonjour registration may have failed. Check the log: `cat /usr/local/var/log/imessage-bridge.log` (brew) or `cat ~/.imessage-bridge/bridge.log` (install script). You can bypass Bonjour by setting `IMESSAGE_BRIDGE_URL` directly.
+Check that the bridge is running: `bridge_curl http://<bind address>:8432/info` (the address the bridge was started with, for example `192.168.15.12`; a bridge pinned to its LAN IPv4 does not listen on localhost) (the wrapper from "Authentication" above; a bare curl gets a `401`, which means the bridge is up and you forgot the header). If it responds, the bridge is up but Bonjour registration may have failed. Check the log: `cat /usr/local/var/log/imessage-bridge.log` (brew) or `cat ~/.imessage-bridge/bridge.log` (install script). You can bypass Bonjour by setting `IMESSAGE_BRIDGE_URL` directly.
 
 **"authorization denied" in the bridge log**
 

@@ -226,6 +226,19 @@ class BindAddressTest(unittest.TestCase):
         self.assertEqual(bound, "127.0.0.1")
         self.assertNotEqual(bound, "0.0.0.0")
 
+    def test_ipv6_literals_are_refused_before_any_socket_exists(self):
+        # The server is an IPv4 ThreadingHTTPServer. ipaddress.ip_address would
+        # accept ::1 and 2001:db8::1 and the bind would then fail with gaierror
+        # at socket creation (Richard, delta review of e57c9a18). Refuse first.
+        for literal in ("::1", "2001:db8::1", "::ffff:127.0.0.1"):
+            with self.assertRaises(ValueError, msg=literal):
+                bridge.resolve_bind_address(literal)
+            try:
+                bound = self._os_bound_address(literal)
+            except ValueError:
+                continue
+            self.fail("--bind %r was accepted and the OS bound %s" % (literal, bound))
+
     def test_a_hostname_is_not_an_address(self):
         # Only literals. A name could resolve anywhere, including everywhere.
         with self.assertRaises(ValueError):
