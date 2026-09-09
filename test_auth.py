@@ -120,6 +120,16 @@ class TokenMatchTest(unittest.TestCase):
     def test_rejects_a_prefix_of_the_token(self):
         self.assertFalse(bridge.token_matches(TEST_TOKEN, TEST_TOKEN[:-1]))
 
+    def test_a_non_ascii_presented_token_is_a_mismatch_not_a_crash(self):
+        # finding 2: hmac.compare_digest raises TypeError when either str is
+        # not ASCII, and the presented value is attacker-controlled.
+        self.assertFalse(bridge.token_matches(TEST_TOKEN, "cafe\u00e9"))
+        self.assertFalse(bridge.token_matches(TEST_TOKEN, "\U0001f680"))
+        self.assertFalse(bridge.token_matches("cafe\u00e9", "cafe"))
+
+    def test_a_non_ascii_token_still_matches_its_own_wire_bytes(self):
+        self.assertTrue(bridge.token_matches("cafe\u00e9", "cafe\u00e9"))
+
     def test_an_empty_expected_token_never_matches(self):
         # Belt and braces: a handler constructed without a token must deny
         # everything rather than accept everything.
@@ -340,6 +350,20 @@ class AuthenticatedRoutesTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["status"], "sent")
         self.assertEqual(self.sends, ["chat-x"])
+
+    def test_a_non_ascii_header_is_a_401_and_the_server_keeps_serving(self):
+        # finding 2, over a real socket: "cafe" plus U+00E9. http.client puts
+        # the value on the wire as latin-1 and http.server decodes it back the
+        # same way, so this is exactly what a hostile client can send.
+        status, body = self._request("GET", "/messages?after=0", "cafe\u00e9")
+        self.assertEqual(status, 401)
+        _, missing = self._request("GET", "/messages?after=0", None)
+        self.assertEqual(body, missing)
+        # The connection that crashed the handler used to take the request
+        # with it. Prove the server is still answering afterward.
+        status, body = self._request("GET", "/messages?after=0", TEST_TOKEN)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), [])
 
     def test_the_401_body_is_identical_for_missing_and_wrong(self):
         _, missing = self._request("GET", "/messages?after=0", None)

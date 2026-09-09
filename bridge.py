@@ -127,11 +127,44 @@ def load_bridge_token(path=None) -> str:
     return token
 
 
+def _token_bytes(value):
+    """Wire bytes for a token value, or None when it has no wire form.
+
+    hmac.compare_digest refuses two str arguments that are not both ASCII and
+    raises TypeError. A request header is attacker-controlled, so that TypeError
+    was a 500-or-worse on any non-ASCII X-Bridge-Token (finding 2). Comparing
+    bytes has no such restriction.
+
+    http.server decodes request headers as latin-1, so encoding back with
+    latin-1 recovers exactly the bytes the client put on the wire. Anything that
+    cannot be encoded that way (a str carrying codepoints above U+00FF, which
+    only a direct caller can produce) returns None and is treated as a
+    mismatch: fail closed, never raise.
+
+    The shared secret itself should be ASCII. A non-ASCII secret still compares
+    correctly against a client that sends the same latin-1 bytes, but the
+    UTF-8-on-the-wire spelling would not match, so keep it ASCII.
+    """
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if not isinstance(value, str):
+        return None
+    try:
+        return value.encode("latin-1")
+    except UnicodeEncodeError:
+        return None
+
+
 def token_matches(expected: str, presented) -> bool:
-    """Constant-time comparison. A missing header is a non-match, not a crash."""
+    """Constant-time comparison. A missing or undecodable header is a
+    non-match, never an exception."""
     if not expected or not presented:
         return False
-    return hmac.compare_digest(expected, presented)
+    expected_bytes = _token_bytes(expected)
+    presented_bytes = _token_bytes(presented)
+    if expected_bytes is None or presented_bytes is None:
+        return False
+    return hmac.compare_digest(expected_bytes, presented_bytes)
 
 
 def should_log_auth_failure(addr: str, now=None) -> bool:
