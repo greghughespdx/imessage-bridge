@@ -195,8 +195,25 @@ repo (`remote-send.ts`, `attachments.ts`, `channel-server.ts`) read it through
 `bridge-auth.ts` and send the header automatically; there is no unauthenticated
 client path.
 
-Every example below omits the header for readability. Add
-`-H "X-Bridge-Token: $(cat ~/.config/imessage-bridge/token)"` to each one.
+**Do not put the token in a curl `-H` argument.** Command-line arguments are
+readable by every user on the machine for as long as the process lives (`ps
+-axww`), and they land in shell history. Feed curl a config file on stdin
+instead - `-K -` - and the secret never becomes an argv entry:
+
+```bash
+# Define this once per shell session, then use it in place of curl.
+bridge_curl() {
+  printf 'header = "X-Bridge-Token: %s"\n' "$(cat ~/.config/imessage-bridge/token)" \
+    | curl -sS -K - "$@"
+}
+
+bridge_curl "http://BRIDGE_HOST:8432/info"
+```
+
+`printf` is a shell builtin, so the token is never an argument to any process;
+the pipe hands it straight to curl, which reads `header = ...` from stdin the
+same way it reads a `.curlrc`. Every example below omits the header for
+readability - run each one through `bridge_curl` rather than adding `-H`.
 
 ### Listen address
 
@@ -246,12 +263,15 @@ Returns `{"status": "sent", "applescript_elapsed_s": 0.42, "attachment_sent": fa
 Use `attachment_b64` unless the caller and the bridge are the same machine.
 
 ```
-curl -X POST http://BRIDGE_HOST:8432/send \
+bridge_curl -X POST http://BRIDGE_HOST:8432/send \
   -H 'Content-Type: application/json' \
   -d '{"chat_id": "iMessage;-;+1234567890",
        "text": "Is this mark a 7 or a 1?",
        "attachment_path": "/ABSOLUTE/PATH/ON/BRIDGE/HOST/crop.png"}'
 ```
+
+(`bridge_curl` is the wrapper defined under "Authentication" above; it supplies
+the token header without putting it in argv.)
 
 The text is sent first, then the image as a second message to the same chat, so the picture arrives under the sentence that explains it. `text` may be `""` or omitted when an attachment is present; with no attachment it is still required.
 
@@ -357,7 +377,7 @@ The channel server found a local chat.db before checking for a remote bridge. Se
 
 **Bridge is not discoverable via Bonjour**
 
-Check that the bridge is running: `curl http://localhost:8432/info`. If it responds, the bridge is up but Bonjour registration may have failed. Check the log: `cat /usr/local/var/log/imessage-bridge.log` (brew) or `cat ~/.imessage-bridge/bridge.log` (install script). You can bypass Bonjour by setting `IMESSAGE_BRIDGE_URL` directly.
+Check that the bridge is running: `bridge_curl http://localhost:8432/info` (the wrapper from "Authentication" above; a bare curl gets a `401`, which means the bridge is up and you forgot the header). If it responds, the bridge is up but Bonjour registration may have failed. Check the log: `cat /usr/local/var/log/imessage-bridge.log` (brew) or `cat ~/.imessage-bridge/bridge.log` (install script). You can bypass Bonjour by setting `IMESSAGE_BRIDGE_URL` directly.
 
 **"authorization denied" in the bridge log**
 
@@ -365,7 +385,7 @@ Same as the empty results issue: Full Disk Access is not granted for the process
 
 **Messages are delayed**
 
-The channel server polls every 1 second by default. If messages seem delayed, check that the bridge is responding: `curl http://<bridge-ip>:8432/info`. Network latency on a local LAN should be sub-millisecond.
+The channel server polls every 1 second by default. If messages seem delayed, check that the bridge is responding: `bridge_curl http://<bridge-ip>:8432/info`. Network latency on a local LAN should be sub-millisecond.
 
 ## License
 

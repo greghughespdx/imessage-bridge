@@ -168,23 +168,43 @@ gate, not the watchdog.
 
 ## Post-restart verification
 
-0. Auth, before anything else:
+0. Auth, before anything else.
+
+**The token never becomes a command-line argument.** `-H "X-Bridge-Token: $TOK"`
+puts the secret in argv, where `ps -axww` shows it to every user on the machine
+and the shell writes it to history. curl reads a config file from stdin with
+`-K -`, and `printf` is a shell builtin, so this wrapper keeps the secret in
+process memory only:
 
 ```bash
-TOK=$(cat ~/.config/imessage-bridge/token)
-curl -s -o /dev/null -w '%{http_code}\n' http://192.168.15.12:8432/healthz
-# expect 401
-curl -s -o /dev/null -w '%{http_code}\n' -H 'X-Bridge-Token: wrong' http://192.168.15.12:8432/healthz
-# expect 401
-curl -s -o /dev/null -w '%{http_code}\n' -H "X-Bridge-Token: $TOK" http://192.168.15.12:8432/healthz
+bridge_curl() {
+  printf 'header = "X-Bridge-Token: %s"\n' "$TOK" | curl -sS -K - "$@"
+}
+
+TOK=$(cat ~/.config/imessage-bridge/token)   # in memory for these checks only
+
+curl -sS -o /dev/null -w '%{http_code}\n' http://192.168.15.12:8432/healthz
+# expect 401 (no header at all)
+curl -sS -o /dev/null -w '%{http_code}\n' -H 'X-Bridge-Token: wrong' \
+  http://192.168.15.12:8432/healthz
+# expect 401 (a wrong header; this literal is not the secret, so argv is fine)
+bridge_curl -o /dev/null -w '%{http_code}\n' http://192.168.15.12:8432/healthz
 # expect 200
-unset TOK
 ```
 
-1. `/healthz` with the header -> `"status": "ok"`.
-2. `curl -s http://192.168.15.12:8432/info` -> responds (version string stays 0.2.0).
+Keep `$TOK` and `bridge_curl` for steps 1-6 below, then, at the end of the
+whole verification:
+
+```bash
+unset TOK
+unset -f bridge_curl
+```
+
+1. `bridge_curl http://192.168.15.12:8432/healthz` -> `"status": "ok"`.
+2. `bridge_curl http://192.168.15.12:8432/info` -> responds (version string
+   stays 0.2.0). Without the header this is a 401, not a failure of the bridge.
 3. Read back recent traffic and confirm bodies are present:
-   `curl -s "http://192.168.15.12:8432/messages?after=$(( ($(date +%s) - 86400) * 1000 ))" | python3 -c "import json,sys; m=json.load(sys.stdin); print(len(m), 'rows,', sum(1 for x in m if x['text'] is None), 'with null text')"`
+   `bridge_curl "http://192.168.15.12:8432/messages?after=$(( ($(date +%s) - 86400) * 1000 ))" | python3 -c "import json,sys; m=json.load(sys.stdin); print(len(m), 'rows,', sum(1 for x in m if x['text'] is None), 'with null text')"`
    Before this deploy the NULL-text count was the number of *dropped* rows;
    after it, those rows appear with real text and the null count should be near
    zero (attachment-only messages legitimately stay null).
@@ -195,7 +215,7 @@ unset TOK
    the tests deliberately never run osascript):
 
 ```bash
-curl -X POST http://192.168.15.12:8432/send \
+bridge_curl -X POST http://192.168.15.12:8432/send \
   -H 'Content-Type: application/json' \
   -d '{"chat_id": "iMessage;-;+1XXXXXXXXXX",
        "text": "mc-am50p deploy check",
