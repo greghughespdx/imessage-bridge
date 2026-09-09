@@ -157,6 +157,167 @@ def resolve_attachment(db_path: str, msg_guid: str, index: int):
     return abs_path, att["mime_type"], att["transfer_name"], att["uti"]
 
 
+# ---------------------------------------------------------------------------
+# attributedBody decoding (mc-yrd7a)
+#
+# Modern macOS stores the message body in message.attributedBody (an
+# NSKeyedArchiver-era "typedstream" blob) and leaves message.text NULL. A read
+# path that selects only m.text therefore drops the message entirely.
+#
+# This is a port of the canonical TypeScript reader at
+# mission-control/channels/imessage/attributed-body.ts (mc-pthof), which was
+# verified against 280,870 real chat.db rows. Keep the two in lockstep: the
+# byte layout, the search window, the error cases and their messages are all
+# intentionally identical.
+#
+# Layout, from a real blob (bytes shown as hex):
+#
+#   04 0B "streamtyped"        header
+#   81 E8 03                   i16 system version 1000
+#   ...
+#   84 84 84 12 "NSAttributedString" 00
+#   84 84 08 "NSObject" 00
+#   85 92 84 84 84 08 "NSString" 01
+#   94 84 01 2B                type descriptor: one field, '+' (C string)
+#   <length> <utf-8 bytes>     the message body
+#   86 ...                     end of object, then the attribute runs
+#
+# "NSString" appears literally exactly once: later strings in the blob are
+# shared-object back-references (0x92 <index>) or bare C strings (0x96), so the
+# first literal occurrence is always the body.
+#
+# Failure is loud by contract. An attributedBody we cannot read is a broken read
+# path, not an empty message, so every failure raises and the caller logs it.
+# Stdlib only, and nothing newer than Python 3.9: the bridge host runs Apple's
+# /usr/bin/python3 (3.9.6 on iMac27) with no third-party packages.
+# ---------------------------------------------------------------------------
+
+
+class AttributedBodyDecodeError(Exception):
+    """Raised when a non-empty attributedBody blob cannot be read."""
+
+
+# 04 0B 's' 't' 'r' 'e' 'a' 'm' 't' 'y' 'p' 'e' 'd'
+TYPEDSTREAM_HEADER = b"\x04\x0bstreamtyped"
+
+# Class name whose first literal occurrence precedes the message body.
+NSSTRING_CLASS = b"NSString"
+
+# Type descriptor introducing the string payload: 0x84 (new type descriptor),
+# 0x01 (one byte of type codes), 0x2B ('+', a length-prefixed C string).
+STRING_MARKER = b"\x84\x01\x2b"
+
+# How far past "NSString" the '+' marker may sit before we give up.
+MARKER_SEARCH_WINDOW = 16
+
+# typedstream integer prefixes: i16 and i32 follow in little-endian order.
+I16_PREFIX = 0x81
+I32_PREFIX = 0x82
+
+
+def _read_typedstream_length(blob: bytes, offset: int):
+    """Read a typedstream length at offset.
+
+    Returns (value, next_offset) where next_offset is just past the length.
+    """
+    if offset >= len(blob):
+        raise AttributedBodyDecodeError(
+            "truncated blob: no length byte after the string marker"
+        )
+    head = blob[offset]
+    if head == I16_PREFIX:
+        if offset + 2 >= len(blob):
+            raise AttributedBodyDecodeError(
+                "truncated blob: i16 length runs past the end"
+            )
+        return blob[offset + 1] | (blob[offset + 2] << 8), offset + 3
+    if head == I32_PREFIX:
+        if offset + 4 >= len(blob):
+            raise AttributedBodyDecodeError(
+                "truncated blob: i32 length runs past the end"
+            )
+        value = (
+            blob[offset + 1]
+            | (blob[offset + 2] << 8)
+            | (blob[offset + 3] << 16)
+            | (blob[offset + 4] << 24)
+        )
+        return value, offset + 5
+    if head >= 0x80:
+        raise AttributedBodyDecodeError(
+            "unsupported typedstream length prefix 0x%x" % head
+        )
+    return head, offset + 1
+
+
+def decode_attributed_body(blob) -> str:
+    """Extract the message body from an attributedBody blob.
+
+    Raises AttributedBodyDecodeError on anything it cannot read. A zero-length
+    body is a legitimate result (attachment-only messages carry U+FFFC, not an
+    empty string, so an empty result is rare but not itself an error).
+    """
+    if blob is None or len(blob) == 0:
+        raise AttributedBodyDecodeError("empty attributedBody blob")
+    blob = bytes(blob)
+
+    if not blob.startswith(TYPEDSTREAM_HEADER):
+        raise AttributedBodyDecodeError(
+            'not a typedstream blob: missing "streamtyped" header'
+        )
+
+    class_at = blob.find(NSSTRING_CLASS, len(TYPEDSTREAM_HEADER))
+    if class_at < 0:
+        raise AttributedBodyDecodeError("no NSString class descriptor in blob")
+
+    search_from = class_at + len(NSSTRING_CLASS)
+    search_limit = min(
+        len(blob), search_from + MARKER_SEARCH_WINDOW + len(STRING_MARKER)
+    )
+    marker_at = blob.find(STRING_MARKER, search_from, search_limit)
+    if marker_at < 0:
+        raise AttributedBodyDecodeError(
+            'no 0x84 0x01 "+" string marker within %d bytes of the NSString '
+            "class descriptor" % MARKER_SEARCH_WINDOW
+        )
+
+    length, start = _read_typedstream_length(blob, marker_at + len(STRING_MARKER))
+    end = start + length
+    if end > len(blob):
+        raise AttributedBodyDecodeError(
+            "declared body length %d runs past the end of a %d-byte blob"
+            % (length, len(blob))
+        )
+
+    try:
+        return blob[start:end].decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise AttributedBodyDecodeError("body is not valid UTF-8: %s" % e)
+
+
+def message_body(text, attributed_body, on_error=None):
+    """Selection rule shared by every read path.
+
+    Prefer the text column when it is non-NULL, otherwise decode
+    attributedBody, otherwise there is no body (returns None so an
+    attachment-only row keeps the null text the channel already handles).
+
+    on_error receives the AttributedBodyDecodeError so the caller can log it
+    loudly; passing no handler re-raises.
+    """
+    if text is not None:
+        return text
+    if not attributed_body:
+        return None
+    try:
+        return decode_attributed_body(attributed_body)
+    except AttributedBodyDecodeError as e:
+        if on_error is None:
+            raise
+        on_error(e)
+        return None
+
+
 def unix_ms_to_apple_ns(unix_ms: int) -> int:
     """Convert Unix milliseconds to Apple epoch nanoseconds."""
     unix_s = unix_ms / 1000.0
@@ -203,11 +364,18 @@ def get_messages(db_path: str, after_unix_ms: int) -> list:
         # Surface image-only messages too: those have NULL text and a
         # cache_has_attachments flag. The old `m.text IS NOT NULL` filter
         # silently dropped every attachment-only message (mc-iee8).
+        #
+        # Modern macOS also leaves m.text NULL and puts the body in
+        # m.attributedBody, so the filter must admit those rows too or every
+        # such message is dropped silently (mc-yrd7a). Measured on iMac27's own
+        # chat.db 2026-09-09: 2,113 rows had NULL text with a non-NULL
+        # attributedBody.
         query = """
             SELECT
                 m.ROWID AS rowid,
                 m.guid,
                 m.text,
+                m.attributedBody,
                 m.date,
                 m.is_from_me,
                 m.cache_has_attachments,
@@ -218,7 +386,9 @@ def get_messages(db_path: str, after_unix_ms: int) -> list:
             LEFT JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
             LEFT JOIN chat c ON cmj.chat_id = c.ROWID
             WHERE m.date > ?
-              AND (m.text IS NOT NULL OR m.cache_has_attachments = 1)
+              AND (m.text IS NOT NULL
+                   OR m.attributedBody IS NOT NULL
+                   OR m.cache_has_attachments = 1)
             ORDER BY m.date ASC
         """
         cursor.execute(query, (after_apple_ns,))
@@ -250,9 +420,16 @@ def get_messages(db_path: str, after_unix_ms: int) -> list:
                 "transfer_name": att["transfer_name"],
                 "is_image": _is_image_attachment(att["mime_type"], att["uti"]),
             })
+        def _log_decode_failure(err, guid=row["guid"]):
+            # Loud by contract: an unreadable body is a broken read path, not
+            # an empty message. Never log the body itself.
+            log.error("attributedBody decode failed guid=%s: %s", guid, err)
+
         messages.append({
             "guid": row["guid"],
-            "text": row["text"],
+            "text": message_body(
+                row["text"], row["attributedBody"], _log_decode_failure
+            ),
             "date": apple_ns_to_unix_ms(row["date"]),
             "is_from_me": bool(row["is_from_me"]),
             "sender": row["sender"],
