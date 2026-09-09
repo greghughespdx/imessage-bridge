@@ -71,6 +71,31 @@ describe('readBridgeToken', () => {
     expect(() => readBridgeToken(tokenFile('  \n'))).toThrow(/is empty/)
   })
 
+  test('throws BridgeTokenError on a directory, not a raw EISDIR', () => {
+    // finding 7: mode 0700 on a directory passes the permission check, so
+    // only an explicit isFile() test can catch this. readFileSync would
+    // otherwise throw a raw EISDIR out of this module.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mc-btl9u-ts-dir-'))
+    fs.chmodSync(dir, 0o700)
+    expect(() => readBridgeToken(dir)).toThrow(BridgeTokenError)
+    expect(() => readBridgeToken(dir)).toThrow(/not a regular file/)
+  })
+
+  test('throws BridgeTokenError on an unreadable file, not a raw EACCES', () => {
+    // Mode 000 passes the group/world check (no bits set at all) and is a
+    // regular file, so the failure lands in readFileSync.
+    const file = tokenFile(TEST_TOKEN, 0o000)
+    let caught: unknown
+    try {
+      readBridgeToken(file)
+    } catch (err) {
+      caught = err
+    }
+    expect(caught).toBeInstanceOf(BridgeTokenError)
+    expect(String(caught)).toContain(file)
+    expect(String(caught)).not.toContain(TEST_TOKEN)
+  })
+
   test('no thrown message contains the token', () => {
     try {
       readBridgeToken(tokenFile(TEST_TOKEN, 0o644))

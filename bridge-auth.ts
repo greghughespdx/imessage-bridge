@@ -46,9 +46,9 @@ export function bridgeTokenFilePath(
  */
 export function readBridgeToken(tokenFile?: string): string {
   const path = tokenFile ? expandHome(tokenFile) : bridgeTokenFilePath()
-  let mode: number
+  let st: ReturnType<typeof statSync>
   try {
-    mode = statSync(path).mode
+    st = statSync(path)
   } catch (err) {
     throw new BridgeTokenError(
       `cannot read the bridge token file ${path}: ${
@@ -57,13 +57,35 @@ export function readBridgeToken(tokenFile?: string): string {
         'shared secret into it, or set IMESSAGE_BRIDGE_TOKEN_FILE.',
     )
   }
-  if (mode & 0o077) {
+  // Regular file, checked BEFORE the mode: a 0700 directory would otherwise
+  // pass the permission test and fail later with a raw EISDIR (finding 7).
+  // The bridge makes the same refusal with stat.S_ISREG.
+  if (!st.isFile()) {
     throw new BridgeTokenError(
-      `bridge token file ${path} is group or world accessible ` +
-        `(mode ${(mode & 0o777).toString(8)}). Run \`chmod 600 ${path}\`.`,
+      `bridge token file ${path} is not a regular file`,
     )
   }
-  const token = readFileSync(path, 'utf8').trim()
+  if (st.mode & 0o077) {
+    throw new BridgeTokenError(
+      `bridge token file ${path} is group or world accessible ` +
+        `(mode ${(st.mode & 0o777).toString(8)}). Run \`chmod 600 ${path}\`.`,
+    )
+  }
+  // A read can fail after a clean stat: no read permission, a race, an I/O
+  // error. Every failure leaves this module as a BridgeTokenError so callers
+  // have one error type to catch. The message carries the path and the OS
+  // reason, never file content.
+  let raw: string
+  try {
+    raw = readFileSync(path, 'utf8')
+  } catch (err) {
+    throw new BridgeTokenError(
+      `cannot read the bridge token file ${path}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    )
+  }
+  const token = raw.trim()
   if (!token) throw new BridgeTokenError(`bridge token file ${path} is empty`)
   return token
 }
