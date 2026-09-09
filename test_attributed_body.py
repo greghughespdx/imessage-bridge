@@ -61,7 +61,9 @@ class DecodeAttributedBodyTest(unittest.TestCase):
         )
 
     def test_decodes_multibyte_utf8(self):
-        body = "café — \U0001f680 日本語".encode("utf-8")
+        # Escapes, not literals: the source file stays pure ASCII while
+        # the fixture still exercises 2-, 3- and 4-byte UTF-8 sequences.
+        body = "caf\u00e9 \u2713 \U0001f680 \u65e5\u672c\u8a9e".encode("utf-8")
         self.assertEqual(
             bridge.decode_attributed_body(make_blob(body)),
             body.decode("utf-8"),
@@ -220,7 +222,7 @@ class GetMessagesAttributedBodyTest(unittest.TestCase):
         base_ns = int((1_700_000_000 - APPLE_EPOCH_OFFSET_S) * 1_000_000_000)
         rows = [
             (1, "guid-text", "plain text row", None),
-            (2, "guid-blob", None, make_blob("blob only ✓".encode("utf-8"))),
+            (2, "guid-blob", None, make_blob("blob only \u2713".encode("utf-8"))),
             (3, "guid-bad", None, b"not a typedstream blob"),
             (4, "guid-empty", None, None),
         ]
@@ -251,7 +253,7 @@ class GetMessagesAttributedBodyTest(unittest.TestCase):
     def test_null_text_row_with_a_blob_is_surfaced_and_decoded(self):
         by_guid = self._by_guid()
         self.assertIn("guid-blob", by_guid)
-        self.assertEqual(by_guid["guid-blob"]["text"], "blob only ✓")
+        self.assertEqual(by_guid["guid-blob"]["text"], "blob only \u2713")
 
     def test_undecodable_row_is_surfaced_with_null_text_not_a_fake_empty_string(self):
         # It reaches the client so the channel's BRIDGE SENT EMPTY BODY log

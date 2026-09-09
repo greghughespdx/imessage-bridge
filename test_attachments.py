@@ -102,7 +102,7 @@ def build_synthetic_db(tmp: str):
         "VALUES (10, 'GUID-TEXT-IMG', 'here is a pic', ?, 0, 1, 1, 'iMessage')",
         (unix_ms_to_apple_ns(now_ms - 3000),),
     )
-    # Msg 2: image only (NULL text) — the case the old query dropped.
+    # Msg 2: image only (NULL text) - the case the old query dropped.
     conn.execute(
         "INSERT INTO message (ROWID, guid, text, date, is_from_me, cache_has_attachments, handle_id, service) "
         "VALUES (11, 'GUID-IMG-ONLY', NULL, ?, 0, 1, 1, 'iMessage')",

@@ -177,7 +177,9 @@ To connect to a specific bridge by name (when multiple bridges are on the networ
 GET /messages?after=<unix_ms>
 ```
 
-Returns a JSON array of message objects with fields: `guid`, `text`, `date` (unix ms), `is_from_me`, `sender`, `chat_guid`.
+Returns a JSON array of message objects with fields: `guid`, `text`, `date` (unix ms), `is_from_me`, `sender`, `chat_guid`, `attachments`.
+
+`text` is the `message.text` column when it is set. Modern macOS often leaves that column NULL and stores the body in `message.attributedBody`, a binary `typedstream` blob; the bridge decodes it and returns the result in the same `text` field, so callers see one field either way. A message with neither a readable body nor an attachment is not returned at all. A blob the bridge cannot decode is logged as an error and `text` comes back `null` rather than an empty string, so a broken read path never looks like an empty message.
 
 **Send a message:**
 
@@ -188,7 +190,40 @@ Content-Type: application/json
 {"chat_id": "iMessage;-;+1234567890", "text": "Hello"}
 ```
 
-Returns `{"status": "sent"}` on success. The `chat_id` is the iMessage chat GUID. You can find it in the `chat_guid` field of received messages.
+Returns `{"status": "sent", "applescript_elapsed_s": 0.42, "attachment_sent": false}` on success. The `chat_id` is the iMessage chat GUID. You can find it in the `chat_guid` field of received messages.
+
+**Send a message with an image:**
+
+`/send` takes one optional image. Two mutually exclusive shapes:
+
+| Field | With | Meaning |
+|-------|------|---------|
+| `attachment_path` | - | An absolute path **on the bridge host**. Nothing is copied and nothing is deleted. |
+| `attachment_b64` | `attachment_name` | The image bytes, base64. The bridge writes them to a `0600` file in its own outbox directory, sends it, then deletes it. |
+
+Use `attachment_b64` unless the caller and the bridge are the same machine.
+
+```
+curl -X POST http://BRIDGE_HOST:8432/send \
+  -H 'Content-Type: application/json' \
+  -d '{"chat_id": "iMessage;-;+1234567890",
+       "text": "Is this mark a 7 or a 1?",
+       "attachment_path": "/ABSOLUTE/PATH/ON/BRIDGE/HOST/crop.png"}'
+```
+
+The text is sent first, then the image as a second message to the same chat, so the picture arrives under the sentence that explains it. `text` may be `""` or omitted when an attachment is present; with no attachment it is still required.
+
+Images only (`.png .jpg .jpeg .heic .heif .gif .webp .bmp .tif .tiff`, or anything `mimetypes` calls `image/*`), 50MB cap. Anything else is a `400`.
+
+**Security note:** `/send` has no authentication, and `attachment_path` will send any image file readable by the bridge process to any chat the caller names. Treat the bridge port the way you would treat unauthenticated shell access to that Mac: bind it to a trusted LAN only, exactly as the plain-text `/send` route already requires.
+
+**Fetch an inbound image attachment:**
+
+```
+GET /attachment?msg=<message-guid>&index=<n>
+```
+
+Returns the raw image bytes. Image attachments only, 50MB cap, and the resolved file must live under `~/Library/Messages/Attachments`.
 
 **Bridge info:**
 
@@ -208,6 +243,12 @@ Returns `{"name": "...", "hostname": "...", "port": 8432, "version": "0.1.0"}`.
 | `--no-bonjour` | off | Disable Bonjour/mDNS advertisement |
 
 The installer also reads `IMESSAGE_BRIDGE_PORT` and `IMESSAGE_BRIDGE_NAME` environment variables.
+
+| Environment variable | Default | Description |
+|----------------------|---------|-------------|
+| `IMESSAGE_BRIDGE_LOG` | /usr/local/var/log/imessage-bridge-app.log | Rotating application log |
+| `IMESSAGE_BRIDGE_OUTBOX_DIR` | ~/.imessage-bridge/outbox | Where `attachment_b64` uploads are staged before sending. Created `0700`; files are `0600` and deleted after the send. Messages.app must be able to read this path. |
+| `IMESSAGE_ATTACHMENTS_DIR` | ~/Library/Messages/Attachments | Base directory inbound attachments must live under |
 
 ## Multiple bridges on one network
 
