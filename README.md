@@ -202,8 +202,16 @@ Every example below omits the header for readability. Add
 
 The bridge binds **one** address, never `0.0.0.0`. By default it resolves this
 host's LAN IPv4 and binds that, falling back to `127.0.0.1` when there is no LAN
-address. `--bind <address>` overrides it; a wildcard (`0.0.0.0`, `::`, `*`) is
-refused at startup rather than silently accepted.
+address. `--bind <address>` overrides it and must be an IP address literal; it
+is parsed with Python's `ipaddress` module, so every spelling of the unspecified
+address (`0.0.0.0`, `::`, and also `0`, `00`, `00000000`, `0x0`, all of which
+getaddrinfo resolves to 0.0.0.0) is refused at startup rather than silently
+accepted.
+
+Detection follows the **default route**. On a machine that can be on a
+full-tunnel VPN, the default route is the tunnel, so detection would bind the
+VPN address. Pin `--bind <lan address>` on any such host instead of relying on
+detection.
 
 **Get messages since a timestamp:**
 

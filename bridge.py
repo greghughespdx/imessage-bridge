@@ -11,6 +11,7 @@ import argparse
 import base64
 import binascii
 import hmac
+import ipaddress
 import json
 import logging
 import logging.handlers
@@ -160,6 +161,11 @@ def should_log_auth_failure(addr: str, now=None) -> bool:
 # including any VPN or guest network it later joins. It now binds one address.
 # ---------------------------------------------------------------------------
 
+# Kept for the error text and for callers that want the obvious spellings.
+# It is NOT the refusal: a string blocklist cannot be one, because the OS
+# accepts many more spellings of the unspecified address than a set can list
+# (`0`, `00`, `00000000` and `0x0` all bind 0.0.0.0 on macOS). The parse in
+# canonical_bind_address is the refusal.
 WILDCARD_ADDRESSES = {"0.0.0.0", "::", "*", ""}
 
 
@@ -168,18 +174,61 @@ def detect_lan_ipv4() -> str:
 
     Opens a UDP socket toward a TEST-NET-1 address and asks the kernel which
     local address it would use. No packets are sent and nothing is contacted.
+    The answer is parsed with `ipaddress` before it is returned, so a garbled
+    or unspecified answer becomes the loopback fallback rather than a bind
+    string nobody checked.
+
+    CAVEAT: this follows the default route. Under a full-tunnel VPN the default
+    route is the VPN, so the address returned here is the VPN address and the
+    bridge would listen on the tunnel. A host that can be on a VPN must pin
+    `--bind <lan address>` rather than rely on detection - the deploy note
+    pins it for iMac27 for exactly this reason.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.connect(("192.0.2.1", 9))
-        addr = sock.getsockname()[0]
+        raw = sock.getsockname()[0]
     except OSError:
         return "127.0.0.1"
     finally:
         sock.close()
-    if not addr or addr in WILDCARD_ADDRESSES or addr.startswith("127."):
+    try:
+        addr = ipaddress.IPv4Address(str(raw).strip())
+    except ValueError:
         return "127.0.0.1"
-    return addr
+    if addr.is_unspecified or addr.is_loopback:
+        return "127.0.0.1"
+    return str(addr)
+
+
+def canonical_bind_address(requested: str) -> str:
+    """Canonical text form of one bindable IP literal.
+
+    Raises ValueError for anything that is not an IP literal, and for every
+    spelling of the unspecified address.
+
+    Why parsing and not a string set: `socket.bind` hands the string to
+    getaddrinfo, which accepts `0`, `00`, `00000000` and `0x0` and resolves
+    every one of them to 0.0.0.0. Comparing against a list of spellings misses
+    all four. Parsing with `ipaddress` accepts only real literals, and
+    `is_unspecified` covers 0.0.0.0, ::, and every equivalent spelling.
+    """
+    text = requested.strip()
+    try:
+        addr = ipaddress.ip_address(text)
+    except ValueError:
+        raise ValueError(
+            "--bind %r is not an IP address literal. Name one address (for "
+            "example 192.168.15.12), or omit --bind to use this host's LAN "
+            "IPv4." % requested
+        )
+    if addr.is_unspecified:
+        raise ValueError(
+            "--bind %r is the unspecified address: it listens on every "
+            "interface. Name one address, or omit --bind to use this host's "
+            "LAN IPv4." % requested
+        )
+    return str(addr)
 
 
 def resolve_bind_address(requested=None) -> str:
@@ -190,13 +239,7 @@ def resolve_bind_address(requested=None) -> str:
     """
     if requested is None:
         return detect_lan_ipv4()
-    requested = requested.strip()
-    if requested in WILDCARD_ADDRESSES:
-        raise ValueError(
-            "--bind %r listens on every interface. Name one address, or omit "
-            "--bind to use this host's LAN IPv4." % requested
-        )
-    return requested
+    return canonical_bind_address(requested)
 
 
 BRIDGE_STARTED_AT = time.time()
@@ -1179,7 +1222,8 @@ def main():
         default=None,
         help=(
             "Address to listen on (default: this host's LAN IPv4, or 127.0.0.1 "
-            "if there is none). A wildcard such as 0.0.0.0 is refused."
+            "if there is none). Must be an IP address literal; every spelling "
+            "of the unspecified address (0.0.0.0, ::, 0, 0x0) is refused."
         ),
     )
     args = parser.parse_args()

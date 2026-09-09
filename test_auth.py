@@ -181,6 +181,46 @@ class BindAddressTest(unittest.TestCase):
             bridge.resolve_bind_address(" 192.168.15.12 "), "192.168.15.12"
         )
 
+    # Every spelling of the unspecified address the OS resolves to 0.0.0.0.
+    # A string blocklist catches only the first three (finding 1): getaddrinfo
+    # happily turns "0", "00", "00000000" and "0x0" into 0.0.0.0 as well.
+    WILDCARD_SPELLINGS = (
+        "0.0.0.0", "::", "*", "", "  ", "0", "00", "00000000", "0x0",
+    )
+
+    def _os_bound_address(self, requested):
+        """Bind a real server the way main() does; return the OS's own answer.
+
+        Not a string check: server.server_address is what the kernel recorded
+        for the listening socket.
+        """
+        addr = bridge.resolve_bind_address(requested)
+        server = ThreadingHTTPServer((addr, 0), bridge.make_handler("/nonexistent.db"))
+        try:
+            return server.server_address[0]
+        finally:
+            server.server_close()
+
+    def test_no_spelling_of_the_wildcard_ever_reaches_a_real_socket(self):
+        for spelling in self.WILDCARD_SPELLINGS:
+            try:
+                bound = self._os_bound_address(spelling)
+            except ValueError:
+                continue  # refused before any socket existed, which is the ask
+            self.fail(
+                "--bind %r was accepted and the OS bound %s" % (spelling, bound)
+            )
+
+    def test_a_named_address_binds_that_address_and_not_the_wildcard(self):
+        bound = self._os_bound_address("127.0.0.1")
+        self.assertEqual(bound, "127.0.0.1")
+        self.assertNotEqual(bound, "0.0.0.0")
+
+    def test_a_hostname_is_not_an_address(self):
+        # Only literals. A name could resolve anywhere, including everywhere.
+        with self.assertRaises(ValueError):
+            bridge.resolve_bind_address("localhost")
+
 
 class AuthenticatedRoutesTest(unittest.TestCase):
     """Every route over a real loopback socket, with and without the header."""

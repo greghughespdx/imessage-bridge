@@ -116,6 +116,21 @@ ssh imac27 'chmod 755 /usr/local/Cellar/imessage-bridge/0.1.0/bin/imessage-bridg
 ssh imac27 '/usr/bin/python3 -m py_compile \
   /usr/local/Cellar/imessage-bridge/0.1.0/bin/imessage-bridge && echo COMPILES'
 
+# 3b. Pin the bind address in the LaunchAgent. Do NOT rely on detection.
+#     detect_lan_ipv4() follows the DEFAULT ROUTE. On a host that is ever on a
+#     full-tunnel VPN, the default route is the tunnel and the bridge would
+#     bind the VPN address; with no route at all at boot it binds 127.0.0.1
+#     and the channel cannot reach it. One plist line removes both failures.
+ssh imac27 '/usr/libexec/PlistBuddy \
+  -c "Print :ProgramArguments" \
+  ~/Library/LaunchAgents/homebrew.mxcl.imessage-bridge.plist'
+# If --bind is not already there, append it (index is the current count):
+ssh imac27 '/usr/libexec/PlistBuddy \
+  -c "Add :ProgramArguments: string --bind" \
+  -c "Add :ProgramArguments: string 192.168.15.12" \
+  ~/Library/LaunchAgents/homebrew.mxcl.imessage-bridge.plist'
+ssh imac27 'plutil -lint ~/Library/LaunchAgents/homebrew.mxcl.imessage-bridge.plist'
+
 # 4. Restart.
 ssh imac27 'launchctl kickstart -k gui/$(id -u)/homebrew.mxcl.imessage-bridge'
 
@@ -125,14 +140,15 @@ ssh imac27 'launchctl kickstart -k gui/$(id -u)/homebrew.mxcl.imessage-bridge'
 ssh imac27 'pgrep -fl imessage-bridge'
 ssh imac27 'tail -5 /usr/local/var/log/imessage-bridge-app.log'
 
-# 6. Confirm the bind address. Default resolves iMac27's own LAN IPv4.
+# 6. Confirm the bind address, from the OS rather than from the log line.
 ssh imac27 'lsof -nP -iTCP:8432 -sTCP:LISTEN'
-# expect 192.168.15.12:8432 (LISTEN), NOT *:8432
+# expect 192.168.15.12:8432 (LISTEN), NOT *:8432 and NOT 127.0.0.1:8432
 ```
 
-If step 6 shows `127.0.0.1` (no default route at boot, say), the channel cannot
-reach it. Pin it rather than hoping: add `--bind 192.168.15.12` to the
-LaunchAgent's ProgramArguments.
+If step 6 shows anything but `192.168.15.12:8432`, step 3b did not take: read
+the plist back and confirm `--bind 192.168.15.12` is in ProgramArguments. Do not
+"fix" it by removing the pin and letting detection run - detection is exactly
+what step 3b exists to avoid.
 
 ## Rollback
 
