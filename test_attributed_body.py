@@ -71,14 +71,18 @@ class DecodeAttributedBodyTest(unittest.TestCase):
 
     def test_decodes_an_i16_length_prefix(self):
         body = b"x" * 400
-        blob = make_blob(body, bytes([bridge.I16_PREFIX, 400 & 0xFF, 400 >> 8]))
+        # Literal 0x81, NOT bridge.I16_PREFIX (finding 6): taking the prefix
+        # from the constant under test means mutating the constant leaves the
+        # test green, so the test asserts nothing about the wire format.
+        blob = make_blob(body, bytes([0x81, 400 & 0xFF, 400 >> 8]))
         self.assertEqual(bridge.decode_attributed_body(blob), "x" * 400)
 
     def test_decodes_an_i32_length_prefix(self):
         body = b"y" * 70000
+        # Literal 0x82, for the same reason as the i16 case above.
         length = bytes(
             [
-                bridge.I32_PREFIX,
+                0x82,
                 70000 & 0xFF,
                 (70000 >> 8) & 0xFF,
                 (70000 >> 16) & 0xFF,
@@ -87,6 +91,28 @@ class DecodeAttributedBodyTest(unittest.TestCase):
         )
         self.assertEqual(bridge.decode_attributed_body(make_blob(body, length)),
                          "y" * 70000)
+
+    def test_the_wire_prefixes_are_0x81_and_0x82(self):
+        # Pins the constants to the bytes Apple actually writes. Without this,
+        # I16_PREFIX could drift and every other test would follow it.
+        self.assertEqual(bridge.I16_PREFIX, 0x81)
+        self.assertEqual(bridge.I32_PREFIX, 0x82)
+
+    def test_rejects_an_unknown_length_prefix(self):
+        # 0x83 is not a length prefix Apple emits. Guessing at it would be
+        # inventing message text, so the decoder refuses.
+        blob = make_blob(b"x" * 400, bytes([0x83, 400 & 0xFF, 400 >> 8]))
+        with self.assertRaises(bridge.AttributedBodyDecodeError) as ctx:
+            bridge.decode_attributed_body(blob)
+        self.assertIn("unsupported typedstream length prefix", str(ctx.exception))
+
+    def test_a_body_with_an_i16_length_does_not_decode_as_a_bare_byte(self):
+        # The 400-byte i16 case, read with the wrong prefix rule, would take
+        # 0x81 as a bare length of 129. Assert the decoded length, not just
+        # that something came back.
+        body = b"x" * 400
+        blob = make_blob(body, bytes([0x81, 400 & 0xFF, 400 >> 8]))
+        self.assertEqual(len(bridge.decode_attributed_body(blob)), 400)
 
     def test_accepts_a_zero_length_body(self):
         self.assertEqual(bridge.decode_attributed_body(make_blob(b"")), "")
