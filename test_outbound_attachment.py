@@ -65,40 +65,104 @@ class BuildSendScriptTest(unittest.TestCase):
         self.assertNotIn("POSIX file", script)
 
     def test_attachment_follows_the_text(self):
+        # This is the exact shape that delivered live test 1 on 2026-09-09
+        # (attachment row 19396, transfer_state 5). Do not change it.
         script = bridge.build_send_script("chat-x", "look at this", "/tmp/pic.png")
         lines = [line.strip() for line in script.splitlines()]
         self.assertEqual(
             lines,
             [
-                'set theAttachment to (POSIX file "/tmp/pic.png") as alias',
                 'tell application "Messages"',
                 'set targetChat to chat id "chat-x"',
                 'send "look at this" to targetChat',
-                "send theAttachment to targetChat",
+                'send POSIX file "/tmp/pic.png" to targetChat',
                 "end tell",
             ],
         )
 
-    def test_file_specifier_is_built_before_the_tell_block(self):
-        # mc-am50p: the alias is resolved by the script itself, outside
-        # Messages' sandbox, and only the resolved object crosses into the
-        # tell block. `POSIX file` must not appear inside it.
-        script = bridge.build_send_script("chat-x", "t", "/tmp/pic.png")
-        lines = script.splitlines()
-        self.assertTrue(lines[0].startswith("set theAttachment to"))
-        self.assertEqual(lines[1], 'tell application "Messages"')
-        inside = "\n".join(lines[2:])
-        self.assertNotIn("POSIX file", inside)
-
     def test_attachment_alone_when_text_is_empty(self):
         script = bridge.build_send_script("chat-x", "", "/tmp/pic.png")
         self.assertNotIn("send \"\" to targetChat", script)
-        self.assertIn('(POSIX file "/tmp/pic.png") as alias', script)
-        self.assertIn("send theAttachment to targetChat", script)
+        self.assertIn('send POSIX file "/tmp/pic.png" to targetChat', script)
 
     def test_quotes_and_backslashes_in_the_path_are_escaped(self):
         script = bridge.build_send_script("chat-x", "", '/tmp/a"b\\c.png')
-        self.assertIn('(POSIX file "/tmp/a\\"b\\\\c.png") as alias', script)
+        self.assertIn('send POSIX file "/tmp/a\\"b\\\\c.png" to targetChat', script)
+
+
+class OutboxJanitorTest(unittest.TestCase):
+    """sweep_outbox: bounded, name-matched, direct children only."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mc-am50p-janitor-")
+        self.outbox = os.path.join(self.tmp, "outbox")
+        os.makedirs(self.outbox, mode=0o700)
+        self.now = 1_800_000_000.0
+        self.day = 86400
+
+    def _staged(self, name, age_days, hexpart="0123456789abcdef0123456789abcdef"):
+        path = os.path.join(self.outbox, "%s-%s" % (hexpart, name))
+        with open(path, "wb") as f:
+            f.write(PNG_BYTES)
+        os.utime(path, (self.now - age_days * self.day, self.now - age_days * self.day))
+        return path
+
+    def _sweep(self, **kw):
+        return bridge.sweep_outbox(
+            self.outbox, max_age_s=kw.pop("max_age_s", 30 * self.day),
+            max_deletes=kw.pop("max_deletes", 50), now=self.now,
+        )
+
+    def test_deletes_only_expired_bridge_staged_files(self):
+        old = self._staged("old.png", 31)
+        fresh = self._staged("fresh.png", 29, hexpart="f" * 32)
+        foreign = os.path.join(self.outbox, "mc-am50p-test1.png")
+        with open(foreign, "wb") as f:
+            f.write(PNG_BYTES)
+        os.utime(foreign, (self.now - 400 * self.day, self.now - 400 * self.day))
+        self.assertEqual(self._sweep(), 1)
+        self.assertFalse(os.path.exists(old))
+        self.assertTrue(os.path.exists(fresh))
+        self.assertTrue(os.path.exists(foreign), "a file the bridge did not stage was deleted")
+
+    def test_skips_symlinks_and_directories_even_with_matching_names(self):
+        target = os.path.join(self.tmp, "victim.png")
+        with open(target, "wb") as f:
+            f.write(PNG_BYTES)
+        link = os.path.join(self.outbox, "a" * 32 + "-link.png")
+        os.symlink(target, link)
+        sub = os.path.join(self.outbox, "b" * 32 + "-dir")
+        os.makedirs(sub)
+        old_ts = self.now - 100 * self.day
+        os.utime(link, (old_ts, old_ts), follow_symlinks=False)
+        os.utime(sub, (old_ts, old_ts))
+        self.assertEqual(self._sweep(), 0)
+        self.assertTrue(os.path.lexists(link))
+        self.assertTrue(os.path.exists(target))
+        self.assertTrue(os.path.isdir(sub))
+
+    def test_bounded_per_sweep_oldest_first(self):
+        paths = [self._staged("p%d.png" % i, 40 + i, hexpart=("%032x" % i)) for i in range(5)]
+        self.assertEqual(self._sweep(max_deletes=2), 2)
+        # Oldest two (largest age) are gone, the rest remain.
+        self.assertFalse(os.path.exists(paths[4]))
+        self.assertFalse(os.path.exists(paths[3]))
+        for p in paths[:3]:
+            self.assertTrue(os.path.exists(p))
+
+    def test_missing_outbox_is_zero_not_an_error(self):
+        self.assertEqual(
+            bridge.sweep_outbox(os.path.join(self.tmp, "nope"), max_age_s=1, now=self.now), 0
+        )
+
+    def test_defaults_come_from_module_settings(self):
+        self._staged("old.png", bridge.OUTBOX_RETENTION_DAYS + 1)
+        orig = bridge.OUTBOX_DIR
+        bridge.OUTBOX_DIR = self.outbox
+        try:
+            self.assertEqual(bridge.sweep_outbox(now=self.now), 1)
+        finally:
+            bridge.OUTBOX_DIR = orig
 
 
 class SendMessageArgvTest(unittest.TestCase):
@@ -381,6 +445,11 @@ class SendRouteTest(unittest.TestCase):
 
         bridge.wait_for_attachment_transfer = fake_wait
 
+        # The janitor runs in a thread after a kept send; record instead.
+        self._orig_janitor = bridge.start_outbox_janitor
+        self.janitor_runs = []
+        bridge.start_outbox_janitor = lambda: self.janitor_runs.append(True)
+
         with bridge._SEND_STATS_LOCK:
             self._orig_stats = dict(bridge.SEND_STATS)
             bridge.SEND_STATS["attachment_sent"] = 0
@@ -398,6 +467,7 @@ class SendRouteTest(unittest.TestCase):
         bridge.send_message = self._orig_send
         bridge.probe_outgoing_row = self._orig_probe
         bridge.wait_for_attachment_transfer = self._orig_wait
+        bridge.start_outbox_janitor = self._orig_janitor
         bridge.OUTBOX_DIR = self._orig_outbox
         with bridge._SEND_STATS_LOCK:
             bridge.SEND_STATS.clear()
@@ -647,6 +717,14 @@ class SendRouteTest(unittest.TestCase):
         self.assertEqual(len(os.listdir(bridge.OUTBOX_DIR)), 1)
         kept = os.path.join(bridge.OUTBOX_DIR, os.listdir(bridge.OUTBOX_DIR)[0])
         self.assertEqual(stat.S_IMODE(os.stat(kept).st_mode), 0o600)
+        self.assertEqual(self.janitor_runs, [True], "janitor did not run after a kept file")
+
+    def test_janitor_does_not_run_when_nothing_was_kept(self):
+        self._post(self._b64_payload())
+        self.wait_result = {"outcome": "missing", "detail": "none"}
+        self._post(self._b64_payload())
+        self._post({"chat_id": "chat-x", "text": "t", "attachment_path": self.png})
+        self.assertEqual(self.janitor_runs, [])
 
     def test_healthz_exposes_the_attachment_counters(self):
         self._post(self._b64_payload())

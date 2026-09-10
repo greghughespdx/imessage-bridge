@@ -260,7 +260,7 @@ For a text-only send, "success" means Messages.app accepted the AppleScript. cha
 | Field | With | Meaning |
 |-------|------|---------|
 | `attachment_path` | - | An absolute path **on the bridge host**. Nothing is copied and nothing is deleted. |
-| `attachment_b64` | `attachment_name` | The image bytes, base64. The bridge writes them to a `0600` file in its own outbox directory (inside `~/Library/Messages/Attachments/`, the one place the sandboxed Messages.app is allowed to read from), sends it, then deletes it once the transfer is confirmed. |
+| `attachment_b64` | `attachment_name` | The image bytes, base64. The bridge writes them to a `0600` file in its own outbox directory (inside `~/Library/Messages/Attachments/`, the one place the sandboxed Messages.app is allowed to read from), sends it, and confirms the transfer in chat.db; see "staged_file_kept" below for what happens to the file afterwards. |
 
 Use `attachment_b64` unless the caller and the bridge are the same machine.
 
@@ -273,7 +273,7 @@ Use `attachment_b64` unless the caller and the bridge are the same machine.
 
 `attachment_sent: true` is never returned for a transfer chat.db did not mark finished. A 502 with `text_sent: true` means the text half went out as its own message before the picture failed. `/healthz` counts both outcomes in `send_stats.attachment_sent` and `send_stats.attachment_failed`.
 
-`staged_file_kept: true` means Messages referenced the staged file directly instead of copying it into its own store, so the bridge left the `0600` file in place rather than orphan the transcript row on the Mac. On macOS 15.7.4 this is what happens every time (live test 2026-09-09: the delivered row's `filename` was the staged path), so expect one file per sent picture to accumulate in the outbox, the same way Messages keeps its own copies of every attachment. The bridge deletes the staged file only when the send fails or Messages made its own copy.
+`staged_file_kept: true` means Messages referenced the staged file directly instead of copying it into its own store, so the bridge left the `0600` file in place rather than orphan the transcript row on the Mac. On macOS 15.7.4 this is what happens every time (live test 2026-09-09: the delivered row's `filename` was the staged path), so one file per sent picture stays in the outbox, the same way Messages keeps its own copies of every attachment. The bridge deletes the staged file immediately only when the send fails or Messages made its own copy. A bounded janitor runs after each kept send and removes bridge-staged files (names `<32 hex>-<name>`, regular files owned by the bridge user, direct children only) older than `IMESSAGE_BRIDGE_OUTBOX_RETENTION_DAYS` (default 30), at most 50 per sweep; the transcript row on the Mac for such an old picture then shows a missing image, which is the trade accepted here.
 
 ```
 bridge_curl -X POST http://BRIDGE_HOST:8432/send \
@@ -326,6 +326,7 @@ The installer also reads `IMESSAGE_BRIDGE_PORT` and `IMESSAGE_BRIDGE_NAME` envir
 | `IMESSAGE_BRIDGE_TOKEN_FILE` | ~/.config/imessage-bridge/token | Shared secret for the `X-Bridge-Token` header. Must be `0600`. Read by the bridge AND by every client. |
 | `IMESSAGE_BRIDGE_OUTBOX_DIR` | ~/Library/Messages/Attachments/imessage-bridge-outbox | Where `attachment_b64` uploads are staged before sending. Files are `0600` and deleted once chat.db confirms the transfer. Messages.app is sandboxed and can only read paths its entitlements grant (`~/Library/Messages/`, `~/Media/`, `~/Downloads`, a few caches); the old default `~/.imessage-bridge/outbox` was outside that grant and every picture sent from it failed with `transfer_state` 6 (mc-am50p, 2026-09-09). Keep any override inside the grant. The directory is checked on every staged send, not only when it is created: it must be a directory owned by the bridge's own user (anything else is refused with an error), and any group or world bits are chmod'ed away to `0700` first, with a warning in the log naming the old mode. |
 | `IMESSAGE_BRIDGE_ATTACHMENT_TIMEOUT_S` | 30 | How long `POST /send` waits for the attachment row in chat.db to reach a final `transfer_state` before answering 502. |
+| `IMESSAGE_BRIDGE_OUTBOX_RETENTION_DAYS` | 30 | Age after which the outbox janitor deletes bridge-staged files that Messages kept referencing (see "staged_file_kept"). |
 | `IMESSAGE_ATTACHMENTS_DIR` | ~/Library/Messages/Attachments | Base directory inbound attachments must live under |
 
 ## Multiple bridges on one network

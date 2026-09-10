@@ -18,6 +18,7 @@ import logging.handlers
 import mimetypes
 import os
 import platform
+import re
 import socket
 import sqlite3
 import stat
@@ -360,6 +361,16 @@ ATTACHMENT_CONFIRM_TIMEOUT_S = float(
 )
 ATTACHMENT_CONFIRM_POLL_S = 0.5
 
+# Messages on macOS 15.7.4 does not copy a sent file into its own store; the
+# delivered row's filename stays the staged path (live test 1, 2026-09-09).
+# So a delivered staged file is kept, and the outbox grows by one file per
+# picture. A bounded janitor trims files the bridge itself staged (names are
+# <32 hex>-<name>) once they are older than this, at most this many per
+# sweep, never recursing and never touching anything it did not create.
+OUTBOX_RETENTION_DAYS = float(os.environ.get("IMESSAGE_BRIDGE_OUTBOX_RETENTION_DAYS", "30"))
+OUTBOX_JANITOR_MAX_DELETES = 50
+_STAGED_NAME_RE = re.compile(r"^[0-9a-f]{32}-.")
+
 # Outbound is images only, matching the inbound rule ("Only image attachments
 # are served"). mimetypes on Apple's 3.9 does not know HEIC, so the extension
 # set carries the formats it misses.
@@ -506,6 +517,59 @@ def discard_staged_attachment(path) -> None:
         os.unlink(path)
     except OSError as e:
         log.warning("could not delete staged attachment %s: %s", path, e)
+
+
+def sweep_outbox(outbox_dir=None, max_age_s=None, max_deletes=None, now=None) -> int:
+    """Delete bridge-staged files older than max_age_s, at most max_deletes.
+
+    Bounded on purpose: only direct children of the outbox, only regular
+    files (no symlinks, no directories), only names the bridge's own staging
+    produced (<32 hex>-<name>), only files owned by this uid, oldest first.
+    Returns the number deleted. Never raises; problems go to the log.
+    """
+    outbox_dir = OUTBOX_DIR if outbox_dir is None else outbox_dir
+    max_age_s = OUTBOX_RETENTION_DAYS * 86400 if max_age_s is None else max_age_s
+    max_deletes = OUTBOX_JANITOR_MAX_DELETES if max_deletes is None else max_deletes
+    now = time.time() if now is None else now
+    try:
+        names = os.listdir(outbox_dir)
+    except OSError as e:
+        log.warning("outbox janitor: cannot list %s: %s", outbox_dir, e)
+        return 0
+
+    candidates = []
+    for name in names:
+        if not _STAGED_NAME_RE.match(name):
+            continue
+        path = os.path.join(outbox_dir, name)
+        try:
+            st = os.lstat(path)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+            continue
+        if now - st.st_mtime < max_age_s:
+            continue
+        candidates.append((st.st_mtime, path))
+
+    deleted = 0
+    for _, path in sorted(candidates)[:max_deletes]:
+        try:
+            os.unlink(path)
+            deleted += 1
+        except OSError as e:
+            log.warning("outbox janitor: could not delete %s: %s", path, e)
+    if deleted or len(candidates) > max_deletes:
+        log.info(
+            "outbox janitor: deleted %d of %d expired staged files (older than %.0f days)",
+            deleted, len(candidates), max_age_s / 86400,
+        )
+    return deleted
+
+
+def start_outbox_janitor() -> None:
+    """Run sweep_outbox in the background so a send never waits on it."""
+    threading.Thread(target=sweep_outbox, daemon=True).start()
 
 
 def _expand_attachment_path(raw: str) -> str:
@@ -887,20 +951,18 @@ def build_send_script(chat_id: str, text: str, attachment_path=None) -> str:
             f'to chat id "{escaped_chat_id}"'
         )
 
-    # The file specifier is built OUTSIDE the tell block, as an alias, so the
-    # reference Messages receives is a resolved file object and not a string
-    # it has to interpret inside its own sandbox. `as alias` also fails the
-    # script cleanly (exit 1, "File ... wasn't found") if the path is gone,
-    # instead of handing Messages a dangling reference.
-    escaped_path = escape_applescript_string(attachment_path)
+    # This exact shape delivered a picture to Greg's phone on 2026-09-09
+    # (live test 1, attachment row 19396, transfer_state 5) once the file was
+    # staged inside the Messages sandbox grant. The script shape was never
+    # the problem; the file's location was. Keep the shape that worked.
     lines = [
-        f'set theAttachment to (POSIX file "{escaped_path}") as alias',
         'tell application "Messages"',
         f'    set targetChat to chat id "{escaped_chat_id}"',
     ]
     if text:
         lines.append(f'    send "{escape_applescript_string(text)}" to targetChat')
-    lines.append("    send theAttachment to targetChat")
+    escaped_path = escape_applescript_string(attachment_path)
+    lines.append(f'    send POSIX file "{escaped_path}" to targetChat')
     lines.append("end tell")
     return "\n".join(lines)
 
@@ -1414,11 +1476,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
             # The transcript row on this Mac points at our file. Deleting it
             # would orphan that row, so it stays: 0600, inside the Messages
             # attachment store, exactly where Messages keeps its own copies.
+            # The janitor trims files older than OUTBOX_RETENTION_DAYS.
             log.info(
                 "attachment confirmed chat=%s transfer_state=5 confirm=%.1fs "
                 "staged file kept (Messages references it directly)",
                 chat_id, confirm_elapsed,
             )
+            start_outbox_janitor()
         else:
             discard_staged_attachment(staged_path)
 
