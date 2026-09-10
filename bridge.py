@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -293,6 +294,26 @@ SEND_STATS = {
     "attachment_failed": 0,
 }
 _SEND_STATS_LOCK = threading.Lock()
+
+# One lock per chat for attachment sends (mc-am50p review, Richard 2026-09-09).
+# The confirmation reads chat.db for the row THIS request created, and the
+# only way to know which row that is, is to read the chat's highest attachment
+# ROWID before osascript runs and accept only rows above it. Two overlapping
+# sends to the same chat (ThreadingHTTPServer runs requests in parallel) would
+# otherwise share a baseline and could both claim the same row. So the
+# baseline read, the osascript send, and the confirmation wait run under the
+# chat's lock. Text-only sends do not take it; they create no attachment row.
+_CHAT_SEND_LOCKS = {}
+_CHAT_SEND_LOCKS_GUARD = threading.Lock()
+
+
+def chat_send_lock(chat_id: str) -> threading.Lock:
+    """The serialization lock for attachment sends to one chat."""
+    with _CHAT_SEND_LOCKS_GUARD:
+        lock = _CHAT_SEND_LOCKS.get(chat_id)
+        if lock is None:
+            lock = _CHAT_SEND_LOCKS[chat_id] = threading.Lock()
+        return lock
 
 # Apple epoch is seconds since 2001-01-01 00:00:00 UTC
 # Unix epoch is seconds since 1970-01-01 00:00:00 UTC
@@ -1056,31 +1077,106 @@ def probe_outgoing_row(db_path: str, chat_id: str, sent_after_unix_ms: int) -> N
     threading.Thread(target=_probe, daemon=True).start()
 
 
-def _query_newest_outgoing_attachment(db_path: str, chat_id: str, after_apple_ns: int):
-    """One read-only look at chat.db for the newest outgoing attachment row on
-    an is_from_me message in this chat dated after the send. None if absent."""
+def _open_chat_db_readonly(db_path: str):
     uri = f"file:{db_path}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
+    cur = conn.cursor()
+    cur.execute("PRAGMA query_only = ON")
+    return conn, cur
+
+
+def read_attachment_high_water(db_path: str, chat_id: str) -> int:
+    """The highest outgoing attachment ROWID in this chat right now, or 0.
+
+    Read BEFORE osascript runs, under the chat's send lock. The row this
+    request creates will have a ROWID above this mark; every row at or below
+    it belongs to an earlier send and is never this request's evidence.
+    Raises sqlite3.Error when chat.db cannot be read.
+    """
+    conn, cur = _open_chat_db_readonly(db_path)
     try:
-        cur = conn.cursor()
-        cur.execute("PRAGMA query_only = ON")
         cur.execute(
             """
-            SELECT a.ROWID, a.transfer_state, a.filename, m.ROWID, m.is_sent, m.error
+            SELECT COALESCE(MAX(a.ROWID), 0)
+            FROM attachment a
+            JOIN message_attachment_join maj ON maj.attachment_id = a.ROWID
+            JOIN message m ON m.ROWID = maj.message_id
+            JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+            JOIN chat c ON cmj.chat_id = c.ROWID
+            WHERE c.guid = ? AND m.is_from_me = 1 AND a.is_outgoing = 1
+            """,
+            (chat_id,),
+        )
+        return int(cur.fetchone()[0] or 0)
+    finally:
+        conn.close()
+
+
+def _same_file(row_filename, expected_path) -> bool:
+    if not row_filename or not expected_path:
+        return False
+    try:
+        return os.path.realpath(_expand_attachment_path(row_filename)) == os.path.realpath(
+            expected_path
+        )
+    except (OSError, ValueError):
+        return False
+
+
+def _query_outgoing_attachment_for_send(
+    db_path: str, chat_id: str, after_apple_ns: int, after_rowid, expected_path
+):
+    """One read-only look at chat.db for THIS send's outgoing attachment row.
+
+    Candidates are outgoing attachment rows on is_from_me messages in this
+    chat, dated after the send and with ROWID above after_rowid (the high-water
+    mark read before osascript). Among them the row is identified by, in order:
+      1. filename resolving to expected_path (on macOS 15.7.4 Messages keeps
+         the staged path as the row's filename; live test 1, row 19396);
+      2. filename or transfer_name whose basename is expected_path's basename
+         (Messages copied the file into its own store under the same name);
+      3. the lowest new ROWID whose filename is not yet populated (the row is
+         being created; under the per-chat lock nothing else is creating one).
+    A newer row that belongs to a different file is never this send's row.
+    With no expected_path the identity is the high-water mark alone: the
+    lowest new ROWID above it. Returns None while no candidate matches.
+    """
+    conn, cur = _open_chat_db_readonly(db_path)
+    try:
+        cur.execute(
+            """
+            SELECT a.ROWID, a.transfer_state, a.filename, m.ROWID, m.is_sent, m.error,
+                   a.transfer_name
             FROM attachment a
             JOIN message_attachment_join maj ON maj.attachment_id = a.ROWID
             JOIN message m ON m.ROWID = maj.message_id
             JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
             JOIN chat c ON cmj.chat_id = c.ROWID
             WHERE c.guid = ? AND m.is_from_me = 1 AND m.date > ?
-              AND a.is_outgoing = 1
-            ORDER BY a.ROWID DESC LIMIT 1
+              AND a.is_outgoing = 1 AND a.ROWID > ?
+            ORDER BY a.ROWID ASC
             """,
-            (chat_id, after_apple_ns),
+            (chat_id, after_apple_ns, after_rowid if after_rowid is not None else 0),
         )
-        row = cur.fetchone()
+        rows = cur.fetchall()
     finally:
         conn.close()
+
+    expected_base = os.path.basename(expected_path) if expected_path else None
+    by_path = by_name = unnamed = None
+    if not expected_path and rows:
+        unnamed = rows[0]
+    for row in rows:
+        filename, transfer_name = row[2], row[6]
+        if by_path is None and _same_file(filename, expected_path):
+            by_path = row
+        elif by_name is None and expected_base and expected_base in (
+            os.path.basename(filename or ""), transfer_name or "",
+        ):
+            by_name = row
+        elif unnamed is None and not filename:
+            unnamed = row
+    row = by_path or by_name or unnamed
     if row is None:
         return None
     return {
@@ -1101,6 +1197,8 @@ def wait_for_attachment_transfer(
     poll_s=None,
     now=None,
     sleep=None,
+    after_rowid=None,
+    expected_path=None,
 ) -> dict:
     """Block until the attachment row for this send reaches a final
     transfer_state, or the timeout passes (mc-mnvrm).
@@ -1111,6 +1209,13 @@ def wait_for_attachment_transfer(
     attachment.transfer_state: 5 for every delivered attachment in chat.db, 6
     for every failed one. message.is_sent is NOT used: Greg's phone showed
     texts arriving while chat.db still said is_sent 0.
+
+    after_rowid is the chat's attachment high-water mark read before the send
+    (read_attachment_high_water); only rows above it count. expected_path is
+    the file this send handed to Messages; the row must be bound to it (see
+    _query_outgoing_attachment_for_send). Without them the wait falls back to
+    the date filter alone, which a completed row from the preceding two
+    seconds can satisfy; the route always passes both.
 
     Returns {"outcome": ..., "detail": ..., **row fields}. outcome is one of:
       "sent"     transfer_state reached ATTACHMENT_TRANSFER_DONE
@@ -1130,7 +1235,9 @@ def wait_for_attachment_transfer(
     last = None
     while True:
         try:
-            last = _query_newest_outgoing_attachment(db_path, chat_id, after_apple_ns)
+            last = _query_outgoing_attachment_for_send(
+                db_path, chat_id, after_apple_ns, after_rowid, expected_path
+            )
         except sqlite3.Error as e:
             return {"outcome": "error", "detail": "chat.db read failed: %s" % e}
         if last is not None:
@@ -1439,38 +1546,75 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.send_error_json(500, "Cannot stage attachment")
             return
 
-        sent_at_ms = int(time.time() * 1000) - 2000  # 2s slack for clock/db skew
-        try:
-            elapsed = send_message(chat_id, str(text), send_path)
-        except subprocess.TimeoutExpired:
-            with _SEND_STATS_LOCK:
-                SEND_STATS["failed"] += 1
-                SEND_STATS["last_error"] = "osascript timeout after 60s"
-            log.error("send TIMEOUT chat=%s (osascript >60s)", chat_id)
-            discard_staged_attachment(staged_path)
-            self.send_error_json(500, "AppleScript timed out after 60s")
-            return
-        except RuntimeError as e:
-            discard_staged_attachment(staged_path)
-            self.send_error_json(500, str(e))
-            return
+        # An attachment send holds the chat's lock from the high-water read,
+        # through osascript, to the end of the confirmation wait, so no other
+        # send to this chat can create an attachment row that this request
+        # might mistake for its own. Text-only sends are not serialized.
+        serialize = chat_send_lock(chat_id) if send_path is not None else nullcontext()
+        with serialize:
+            after_rowid = None
+            if send_path is not None:
+                try:
+                    after_rowid = read_attachment_high_water(self.db_path, chat_id)
+                except sqlite3.Error as e:
+                    # Nothing has been sent. Without a baseline the transfer
+                    # could not be confirmed, so the contract (200 only after
+                    # chat.db shows state 5) makes this a 502 before the send.
+                    detail = "chat.db read failed before send: %s" % e
+                    with _SEND_STATS_LOCK:
+                        SEND_STATS["attachment_failed"] += 1
+                        SEND_STATS["last_error"] = ("attachment error: %s" % detail)[:300]
+                    log.error("attachment ERROR chat=%s (not sent): %s", chat_id, detail)
+                    discard_staged_attachment(staged_path)
+                    self.send_json(502, {
+                        "status": "attachment_failed",
+                        "error": "attachment not delivered: %s" % detail,
+                        "attachment_outcome": "error",
+                        "applescript_elapsed_s": 0.0,
+                        "text_sent": False,
+                        "attachment_sent": False,
+                        "attachment_transfer_state": None,
+                        "attachment_confirm_s": 0.0,
+                    })
+                    return
 
-        if send_path is None:
-            probe_outgoing_row(self.db_path, chat_id, sent_at_ms)
-            self.send_json(200, {
-                "status": "sent",
-                "applescript_elapsed_s": round(elapsed, 2),
-                "attachment_sent": False,
-            })
-            return
+            sent_at_ms = int(time.time() * 1000) - 2000  # 2s slack for clock/db skew
+            try:
+                elapsed = send_message(chat_id, str(text), send_path)
+            except subprocess.TimeoutExpired:
+                with _SEND_STATS_LOCK:
+                    SEND_STATS["failed"] += 1
+                    SEND_STATS["last_error"] = "osascript timeout after 60s"
+                log.error("send TIMEOUT chat=%s (osascript >60s)", chat_id)
+                discard_staged_attachment(staged_path)
+                self.send_error_json(500, "AppleScript timed out after 60s")
+                return
+            except RuntimeError as e:
+                discard_staged_attachment(staged_path)
+                self.send_error_json(500, str(e))
+                return
 
-        # mc-mnvrm: osascript exit 0 is not delivery. Hold the response, and
-        # the staged file, until chat.db shows the transfer finished or failed.
-        # The file must outlive this wait: Messages reads it during the
-        # transfer, not at the moment the AppleScript returns.
-        t1 = time.monotonic()
-        result = wait_for_attachment_transfer(self.db_path, chat_id, sent_at_ms)
-        confirm_elapsed = time.monotonic() - t1
+            if send_path is None:
+                probe_outgoing_row(self.db_path, chat_id, sent_at_ms)
+                self.send_json(200, {
+                    "status": "sent",
+                    "applescript_elapsed_s": round(elapsed, 2),
+                    "attachment_sent": False,
+                })
+                return
+
+            # mc-mnvrm: osascript exit 0 is not delivery. Hold the response,
+            # and the staged file, until chat.db shows the transfer finished or
+            # failed. The file must outlive this wait: Messages reads it during
+            # the transfer, not at the moment the AppleScript returns. The row
+            # is bound to this request: above the high-water mark and named
+            # for the file that was sent.
+            t1 = time.monotonic()
+            result = wait_for_attachment_transfer(
+                self.db_path, chat_id, sent_at_ms,
+                after_rowid=after_rowid, expected_path=send_path,
+            )
+            confirm_elapsed = time.monotonic() - t1
         kept = _messages_kept_the_staged_file(result, staged_path)
         if result["outcome"] == "sent" and kept:
             # The transcript row on this Mac points at our file. Deleting it

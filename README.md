@@ -264,7 +264,7 @@ For a text-only send, "success" means Messages.app accepted the AppleScript. cha
 
 Use `attachment_b64` unless the caller and the bridge are the same machine.
 
-**An attachment send is confirmed against chat.db, not against osascript.** After the AppleScript returns, the bridge polls chat.db for the new outgoing attachment row and holds the response until its `transfer_state` is final, up to `IMESSAGE_BRIDGE_ATTACHMENT_TIMEOUT_S` (default 30s):
+**An attachment send is confirmed against chat.db, not against osascript.** Before the AppleScript runs, the bridge reads the chat's highest outgoing attachment ROWID (the high-water mark). After it returns, the bridge polls chat.db for the row this send created (ROWID above the mark, and its `filename` or `transfer_name` naming the file that was sent) and holds the response until its `transfer_state` is final, up to `IMESSAGE_BRIDGE_ATTACHMENT_TIMEOUT_S` (default 30s). A completed row from an earlier send is never taken as this send's evidence. Attachment sends to the same chat are serialized with a per-chat lock covering the mark, the send, and the confirmation, so two overlapping requests cannot share a baseline; sends to different chats run in parallel as before. If chat.db cannot be read before the send, nothing is sent and the response is a 502 with `attachment_outcome: "error"` and `text_sent: false`:
 
 | Result | HTTP | Body |
 |--------|------|------|

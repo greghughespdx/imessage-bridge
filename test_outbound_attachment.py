@@ -17,6 +17,7 @@ import sqlite3
 import stat
 import tempfile
 import threading
+import time
 import unittest
 from http.server import ThreadingHTTPServer
 
@@ -726,6 +727,145 @@ class SendRouteTest(unittest.TestCase):
         self._post({"chat_id": "chat-x", "text": "t", "attachment_path": self.png})
         self.assertEqual(self.janitor_runs, [])
 
+    # ---- request identity and per-chat serialization (Richard's review) ----
+
+    def test_wait_is_bound_to_the_high_water_mark_and_the_sent_file(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("INSERT INTO chat (ROWID, guid, style) VALUES (1, 'chat-x', 45)")
+        conn.execute("INSERT INTO message (ROWID, date, is_from_me) VALUES (1, 1, 1)")
+        conn.execute("INSERT INTO chat_message_join VALUES (1, 1)")
+        conn.execute("INSERT INTO attachment (ROWID, filename, transfer_state, is_outgoing) "
+                     "VALUES (77, '~/old.png', 5, 1)")
+        conn.execute("INSERT INTO message_attachment_join VALUES (1, 77)")
+        conn.commit()
+        conn.close()
+        seen = {}
+
+        def fake_wait(db_path, chat_id, sent_after_unix_ms, *a, **k):
+            seen.update(k)
+            return dict(self.wait_result)
+
+        bridge.wait_for_attachment_transfer = fake_wait
+        status, _ = self._post(self._b64_payload())
+        self.assertEqual(status, 200)
+        self.assertEqual(seen["after_rowid"], 77)
+        self.assertEqual(seen["expected_path"], self.sends[0]["attachment_path"])
+
+    def test_unreadable_chat_db_before_the_send_is_502_and_nothing_is_sent(self):
+        orig = bridge.read_attachment_high_water
+
+        def broken(db_path, chat_id):
+            raise sqlite3.OperationalError("unable to open database file")
+
+        bridge.read_attachment_high_water = broken
+        try:
+            status, body = self._post(self._b64_payload(text="the mark"))
+        finally:
+            bridge.read_attachment_high_water = orig
+        self.assertEqual(status, 502)
+        self.assertEqual(body["attachment_outcome"], "error")
+        self.assertFalse(body["text_sent"])
+        self.assertFalse(body["attachment_sent"])
+        self.assertEqual(self.sends, [], "osascript ran without a baseline")
+        self.assertEqual(self.waits, [])
+        self.assertEqual(os.listdir(bridge.OUTBOX_DIR), [])
+        self.assertEqual(self._stats()["attachment_failed"], 1)
+
+    def test_overlapping_same_chat_sends_each_get_their_own_outcome(self):
+        # Regression 2. Two POSTs to the same chat at once, through the REAL
+        # wait against the test chat.db. The stand-in for osascript inserts
+        # the attachment row Messages would create: "good.png" ends at
+        # transfer_state 5, "bad.png" at 6. Each response must report its own
+        # row, and the two sends must not overlap (per-chat lock).
+        conn = sqlite3.connect(self.db_path)
+        conn.execute("INSERT INTO chat (ROWID, guid, style) VALUES (1, 'chat-x', 45)")
+        conn.commit()
+        conn.close()
+        bridge.wait_for_attachment_transfer = self._orig_wait
+        intervals = []
+        lock = threading.Lock()
+
+        def db_send(chat_id, text, attachment_path=None):
+            start = time.monotonic()
+            time.sleep(0.15)  # long enough for the other request to arrive
+            state = 5 if attachment_path.endswith("-good.png") else 6
+            c = sqlite3.connect(self.db_path)
+            cur = c.cursor()
+            cur.execute(
+                "INSERT INTO message (date, is_from_me) VALUES (?, 1)",
+                (bridge.unix_ms_to_apple_ns(int(time.time() * 1000)),),
+            )
+            msg = cur.lastrowid
+            cur.execute("INSERT INTO chat_message_join VALUES (1, ?)", (msg,))
+            cur.execute(
+                "INSERT INTO attachment (filename, transfer_state, is_outgoing) VALUES (?, ?, 1)",
+                (attachment_path, state),
+            )
+            cur.execute("INSERT INTO message_attachment_join VALUES (?, ?)", (msg, cur.lastrowid))
+            c.commit()
+            c.close()
+            with lock:
+                self.sends.append({"attachment_path": attachment_path})
+                intervals.append((start, time.monotonic()))
+            return 0.01
+
+        bridge.send_message = db_send
+        results = {}
+
+        def post(name):
+            payload = self._b64_payload(text="")
+            payload["attachment_name"] = name
+            results[name] = self._post(payload)
+
+        threads = [threading.Thread(target=post, args=(n,)) for n in ("good.png", "bad.png")]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        good_status, good = results["good.png"]
+        bad_status, bad = results["bad.png"]
+        self.assertEqual(good_status, 200)
+        self.assertTrue(good["attachment_sent"])
+        self.assertEqual(good["attachment_transfer_state"], 5)
+        self.assertEqual(bad_status, 502)
+        self.assertEqual(bad["attachment_outcome"], "failed")
+        self.assertEqual(bad["attachment_transfer_state"], 6)
+        # Each response named its own row: the good row is 5, the bad row is 6,
+        # and the bridge did not hand the good outcome to both.
+        stats = self._stats()
+        self.assertEqual(stats["attachment_sent"], 1)
+        self.assertEqual(stats["attachment_failed"], 1)
+        # The lock held: the second send began after the first one ended.
+        self.assertEqual(len(intervals), 2)
+        (s1, e1), (s2, e2) = sorted(intervals)
+        self.assertGreaterEqual(s2, e1, "sends to the same chat overlapped")
+
+    def test_sends_to_different_chats_are_not_serialized(self):
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def slow_send(chat_id, text, attachment_path=None):
+            calls.append(chat_id)
+            if chat_id == "chat-a":
+                started.set()
+                self.assertTrue(release.wait(5))
+            return 0.01
+
+        bridge.send_message = slow_send
+        a = threading.Thread(
+            target=self._post,
+            args=({"chat_id": "chat-a", "text": "", "attachment_path": self.png},),
+        )
+        a.start()
+        self.assertTrue(started.wait(5))
+        status, _ = self._post({"chat_id": "chat-b", "text": "", "attachment_path": self.png})
+        self.assertEqual(status, 200)
+        self.assertEqual(calls, ["chat-a", "chat-b"])
+        release.set()
+        a.join(5)
+
     def test_healthz_exposes_the_attachment_counters(self):
         self._post(self._b64_payload())
         self.wait_result = {"outcome": "missing", "detail": "none"}
@@ -859,12 +999,111 @@ class WaitForAttachmentTransferTest(unittest.TestCase):
         result = self._wait(timeout_s=1.0)
         self.assertEqual(result["outcome"], "missing")
 
-    def test_newest_row_wins(self):
-        self._add_row(transfer_state=6, att_rowid=10)
-        self._add_row(transfer_state=5, att_rowid=11, offset_ms=2000)
-        result = self._wait()
+    # ---- request identity (Richard's review at 104ba51): the row must be
+    # THIS send's row, not the newest row in the chat ----
+
+    def _staged(self, name="crop.png"):
+        path = os.path.join(self.tmp, "%s-%s" % ("c" * 32, name))
+        with open(path, "wb") as f:
+            f.write(PNG_BYTES)
+        return path
+
+    def _wait_bound(self, after_rowid, expected_path, timeout_s=10.0, sleep=None):
+        return bridge.wait_for_attachment_transfer(
+            self.db_path, self.CHAT, self.SENT_AFTER_MS,
+            timeout_s=timeout_s, poll_s=0.5, now=self._now,
+            sleep=sleep or self._sleep,
+            after_rowid=after_rowid, expected_path=expected_path,
+        )
+
+    def test_high_water_mark_reads_the_chats_highest_outgoing_attachment(self):
+        self.assertEqual(bridge.read_attachment_high_water(self.db_path, self.CHAT), 0)
+        self._add_row(transfer_state=5, att_rowid=10)
+        self._add_row(chat_rowid=2, transfer_state=5, att_rowid=50)   # other chat
+        self._add_row(is_outgoing=0, transfer_state=5, att_rowid=60)  # inbound
+        self.assertEqual(bridge.read_attachment_high_water(self.db_path, self.CHAT), 10)
+        with self.assertRaises(sqlite3.Error):
+            bridge.read_attachment_high_water(os.path.join(self.tmp, "nope.db"), self.CHAT)
+
+    def test_a_completed_row_inside_the_slack_window_is_not_this_sends_row(self):
+        # Regression 1. A picture delivered one second BEFORE this send has a
+        # date inside the two-second slack, so the date filter admits it. It
+        # sits at the high-water mark, so it is excluded: the outcome stays
+        # "missing" until this send's own row appears.
+        staged = self._staged()
+        prior = self._add_row(offset_ms=1000, transfer_state=5, att_rowid=10,
+                              filename="~/Library/Messages/Attachments/a/b/earlier.png")
+        mark = bridge.read_attachment_high_water(self.db_path, self.CHAT)
+        self.assertEqual(mark, prior)
+
+        result = self._wait_bound(mark, staged, timeout_s=1.0)
+        self.assertEqual(result["outcome"], "missing")
+        self.assertNotIn("attachment_rowid", result)
+
+        # Same setup, but this send's row lands during the third poll.
+        self.clock[0] = 0.0
+        self.slept = []
+        original_sleep = self._sleep
+
+        def sleep_then_land(s):
+            original_sleep(s)
+            if len(self.slept) == 3:
+                self._add_row(offset_ms=2500, transfer_state=5, att_rowid=11, filename=staged)
+
+        result = self._wait_bound(mark, staged, sleep=sleep_then_land)
         self.assertEqual(result["outcome"], "sent")
         self.assertEqual(result["attachment_rowid"], 11)
+        self.assertEqual(result["filename"], staged)
+
+    def test_the_newest_row_does_not_win_when_it_is_not_this_sends_file(self):
+        # Replaces test_newest_row_wins, which codified the unsafe selector.
+        # Rows 10 and 11 are newer than the mark but belong to other files; 12
+        # is ours and still in flight. The others' final states are not ours.
+        staged = self._staged()
+        mark = 5
+        self._add_row(transfer_state=6, att_rowid=10, filename="~/other-a.png")
+        self._add_row(transfer_state=5, att_rowid=11, offset_ms=2000, filename="~/other-b.png")
+        ours = self._add_row(transfer_state=0, att_rowid=12, offset_ms=1500, filename=staged)
+
+        result = self._wait_bound(mark, staged, timeout_s=1.0)
+        self.assertEqual(result["outcome"], "timeout")
+        self.assertEqual(result["attachment_rowid"], ours)
+
+        self._set_state(ours, 6)
+        result = self._wait_bound(mark, staged)
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["attachment_rowid"], ours)
+
+        # And the inverse: ours is the oldest of the new rows and it delivered,
+        # while a newer row for another file failed.
+        self._set_state(ours, 5)
+        self._add_row(transfer_state=6, att_rowid=13, offset_ms=3000, filename="~/other-c.png")
+        result = self._wait_bound(mark, staged)
+        self.assertEqual(result["outcome"], "sent")
+        self.assertEqual(result["attachment_rowid"], ours)
+
+    def test_rows_at_or_below_the_mark_never_count_even_with_our_path(self):
+        staged = self._staged()
+        self._add_row(transfer_state=5, att_rowid=10, filename=staged)
+        result = self._wait_bound(10, staged, timeout_s=1.0)
+        self.assertEqual(result["outcome"], "missing")
+
+    def test_binds_by_basename_when_messages_copied_the_file(self):
+        staged = self._staged("crop.png")
+        copied = "~/Library/Messages/Attachments/1f/15/GUID/" + os.path.basename(staged)
+        self._add_row(transfer_state=5, att_rowid=10, filename="~/other.png")
+        ours = self._add_row(transfer_state=5, att_rowid=11, filename=copied)
+        result = self._wait_bound(5, staged)
+        self.assertEqual(result["outcome"], "sent")
+        self.assertEqual(result["attachment_rowid"], ours)
+
+    def test_without_a_path_the_identity_is_the_lowest_row_above_the_mark(self):
+        self._add_row(transfer_state=5, att_rowid=10)
+        first_new = self._add_row(transfer_state=6, att_rowid=11)
+        self._add_row(transfer_state=5, att_rowid=12, offset_ms=2000)
+        result = self._wait_bound(10, None)
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["attachment_rowid"], first_new)
 
     def test_unreadable_db_is_error(self):
         result = bridge.wait_for_attachment_transfer(
