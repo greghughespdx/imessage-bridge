@@ -12,6 +12,7 @@ Run: python3 -m pytest test_outbound_attachment.py
 import base64
 import http.client
 import json
+import logging
 import os
 import sqlite3
 import stat
@@ -841,6 +842,95 @@ class SendRouteTest(unittest.TestCase):
         (s1, e1), (s2, e2) = sorted(intervals)
         self.assertGreaterEqual(s2, e1, "sends to the same chat overlapped")
 
+    def test_the_chat_lock_is_held_through_the_confirmation_wait(self):
+        # Richard's review at d4b1d13 (P3): the overlap test above records
+        # intervals that end when send_message returns, so it proves only that
+        # the two osascript calls do not overlap. This test parks the FIRST
+        # request inside wait_for_attachment_transfer and proves the second
+        # same-chat request cannot read its high-water mark or run its send
+        # until the first confirmation releases. Moving the wait outside the
+        # lock makes this fail: the second mark and send land while the first
+        # request is still parked.
+        parked = threading.Event()
+        release = threading.Event()
+        events = []
+        elock = threading.Lock()
+
+        def record(name):
+            with elock:
+                events.append(name)
+
+        def which(path):
+            return "first" if path.endswith("-first.png") else "second"
+
+        orig_high_water = bridge.read_attachment_high_water
+
+        def recording_high_water(db_path, chat_id):
+            record("mark")
+            return orig_high_water(db_path, chat_id)
+
+        def recording_send(chat_id, text, attachment_path=None):
+            record("send:" + which(attachment_path))
+            return 0.01
+
+        def parking_wait(db_path, chat_id, sent_after_unix_ms, *a, **k):
+            name = which(k["expected_path"])
+            record("wait:" + name)
+            if name == "first":
+                parked.set()
+                self.assertTrue(release.wait(10), "test released nothing")
+            return dict(self.wait_result)
+
+        bridge.read_attachment_high_water = recording_high_water
+        bridge.send_message = recording_send
+        bridge.wait_for_attachment_transfer = parking_wait
+        results = {}
+
+        def post(name):
+            payload = self._b64_payload(text="")
+            payload["attachment_name"] = name + ".png"
+            results[name] = self._post(payload)
+
+        try:
+            first = threading.Thread(target=post, args=("first",))
+            first.start()
+            self.assertTrue(parked.wait(5), "first request never reached its wait")
+            second = threading.Thread(target=post, args=("second",))
+            second.start()
+            # The second request stages its file BEFORE taking the chat lock,
+            # so two staged files prove it has arrived and is inside the route.
+            # If the lock is not held through the wait, the second request
+            # runs to completion instead (its mark read and send land in
+            # events), so the poll also stops on that.
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with elock:
+                    leaked = len(events) > 3
+                if leaked or len(os.listdir(bridge.OUTBOX_DIR)) >= 2:
+                    break
+                time.sleep(0.02)
+            time.sleep(0.3)  # grace: if the lock were released, the mark read would land here
+            with elock:
+                self.assertEqual(
+                    events, ["mark", "send:first", "wait:first"],
+                    "second request entered its mark read or send while the first "
+                    "confirmation was still running",
+                )
+            self.assertEqual(len(os.listdir(bridge.OUTBOX_DIR)), 2, "second request never staged")
+            release.set()
+            first.join(5)
+            second.join(5)
+        finally:
+            release.set()
+            bridge.read_attachment_high_water = orig_high_water
+
+        self.assertEqual(results["first"][0], 200)
+        self.assertEqual(results["second"][0], 200)
+        self.assertEqual(
+            events,
+            ["mark", "send:first", "wait:first", "mark", "send:second", "wait:second"],
+        )
+
     def test_sends_to_different_chats_are_not_serialized(self):
         started = threading.Event()
         release = threading.Event()
@@ -1087,6 +1177,74 @@ class WaitForAttachmentTransferTest(unittest.TestCase):
         self._add_row(transfer_state=5, att_rowid=10, filename=staged)
         result = self._wait_bound(10, staged, timeout_s=1.0)
         self.assertEqual(result["outcome"], "missing")
+
+    def test_an_unnamed_final_row_above_the_mark_is_not_this_sends_row(self):
+        # Richard's review at d4b1d13 (P2), his reproduction: mark 10, a new
+        # same-chat outgoing row 11 with filename NULL already at state 5,
+        # expected path present. The lock serializes this process only; that
+        # row can be a manual Messages send or a half-joined earlier row. It
+        # must not authorize "sent" (or, at state 6, "failed") for this
+        # request. The outcome stays "missing" until the row gains our name.
+        staged = self._staged()
+        self._add_row(transfer_state=5, att_rowid=10, filename="~/earlier.png")
+        unnamed = self._add_row(transfer_state=5, att_rowid=11, filename=None)
+        self.assertEqual(bridge.read_attachment_high_water(self.db_path, self.CHAT), 11)
+
+        records = []
+        handler = logging.Handler()
+        handler.emit = records.append
+        logger = logging.getLogger("bridge")
+        old_level = logger.level
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        try:
+            result = self._wait_bound(10, staged, timeout_s=1.0)
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(old_level)
+        self.assertEqual(result["outcome"], "missing", "an unnamed delivered row was reported as ours")
+        self.assertNotIn("attachment_rowid", result)
+        # Observed for diagnostics, once per row across the polls, not per poll.
+        noted = [r.getMessage() for r in records if "row 11" in r.getMessage() and "no filename" in r.getMessage()]
+        self.assertEqual(len(noted), 1, [r.getMessage() for r in records])
+        self.assertGreater(len(self.slept), 1)
+
+        self._set_state(unnamed, 6)
+        result = self._wait_bound(10, staged, timeout_s=1.0)
+        self.assertEqual(result["outcome"], "missing", "an unnamed failed row was reported as ours")
+
+        # An unnamed row plus a named-for-another-file row: still not ours.
+        self._add_row(transfer_state=5, att_rowid=12, offset_ms=2000, filename="~/other.png")
+        result = self._wait_bound(10, staged, timeout_s=1.0)
+        self.assertEqual(result["outcome"], "missing")
+
+        # The row gains the expected filename: now, and only now, it is ours.
+        self.conn.execute(
+            "UPDATE attachment SET filename = ?, transfer_state = 5 WHERE ROWID = ?",
+            (staged, unnamed),
+        )
+        self.conn.commit()
+        result = self._wait_bound(10, staged)
+        self.assertEqual(result["outcome"], "sent")
+        self.assertEqual(result["attachment_rowid"], unnamed)
+
+    def test_the_selector_never_returns_an_unnamed_row_when_a_path_is_expected(self):
+        # Direct check of the one-shot query at the production shape, both
+        # final states, so the rule does not depend on the wait loop.
+        staged = self._staged()
+        for state in (5, 6):
+            rowid = self._add_row(transfer_state=state, filename=None)
+            self.assertIsNone(
+                bridge._query_outgoing_attachment_for_send(
+                    self.db_path, self.CHAT, _apple_ns(self.SENT_AFTER_MS), 0, staged
+                ),
+                "unnamed row %s at state %s was selected" % (rowid, state),
+            )
+        # Without an expected path the high-water rule alone still applies.
+        found = bridge._query_outgoing_attachment_for_send(
+            self.db_path, self.CHAT, _apple_ns(self.SENT_AFTER_MS), 0, None
+        )
+        self.assertIsNotNone(found)
 
     def test_binds_by_basename_when_messages_copied_the_file(self):
         staged = self._staged("crop.png")

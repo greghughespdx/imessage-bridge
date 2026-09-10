@@ -1124,19 +1124,27 @@ def _same_file(row_filename, expected_path) -> bool:
 
 
 def _query_outgoing_attachment_for_send(
-    db_path: str, chat_id: str, after_apple_ns: int, after_rowid, expected_path
+    db_path: str, chat_id: str, after_apple_ns: int, after_rowid, expected_path,
+    observed_unnamed=None,
 ):
     """One read-only look at chat.db for THIS send's outgoing attachment row.
 
     Candidates are outgoing attachment rows on is_from_me messages in this
     chat, dated after the send and with ROWID above after_rowid (the high-water
-    mark read before osascript). Among them the row is identified by, in order:
+    mark read before osascript). With expected_path (the route always passes
+    it) the row is identified by, in order:
       1. filename resolving to expected_path (on macOS 15.7.4 Messages keeps
          the staged path as the row's filename; live test 1, row 19396);
       2. filename or transfer_name whose basename is expected_path's basename
-         (Messages copied the file into its own store under the same name);
-      3. the lowest new ROWID whose filename is not yet populated (the row is
-         being created; under the per-chat lock nothing else is creating one).
+         (Messages copied the file into its own store under the same name).
+    Nothing else binds. A new row whose filename is NULL is NOT taken as this
+    send's row (Richard's review at d4b1d13): the per-chat lock serializes
+    this process only, and a manual Messages send, another process, or a
+    half-joined earlier row can sit above the mark unnamed and already at a
+    final state; reporting its state as this request's result would be a
+    false "sent" or "failed". Such a row is logged once (observed_unnamed, a
+    set the caller keeps across polls) and otherwise ignored; the outcome
+    stays "missing" until a row carries the expected name.
     A newer row that belongs to a different file is never this send's row.
     With no expected_path the identity is the high-water mark alone: the
     lowest new ROWID above it. Returns None while no candidate matches.
@@ -1162,21 +1170,27 @@ def _query_outgoing_attachment_for_send(
     finally:
         conn.close()
 
-    expected_base = os.path.basename(expected_path) if expected_path else None
-    by_path = by_name = unnamed = None
-    if not expected_path and rows:
-        unnamed = rows[0]
-    for row in rows:
-        filename, transfer_name = row[2], row[6]
-        if by_path is None and _same_file(filename, expected_path):
-            by_path = row
-        elif by_name is None and expected_base and expected_base in (
-            os.path.basename(filename or ""), transfer_name or "",
-        ):
-            by_name = row
-        elif unnamed is None and not filename:
-            unnamed = row
-    row = by_path or by_name or unnamed
+    if not expected_path:
+        row = rows[0] if rows else None
+    else:
+        expected_base = os.path.basename(expected_path)
+        by_path = by_name = None
+        for row in rows:
+            filename, transfer_name = row[2], row[6]
+            if by_path is None and _same_file(filename, expected_path):
+                by_path = row
+            elif by_name is None and expected_base in (
+                os.path.basename(filename or ""), transfer_name or "",
+            ):
+                by_name = row
+            elif not filename and observed_unnamed is not None and row[0] not in observed_unnamed:
+                observed_unnamed.add(row[0])
+                log.info(
+                    "attachment row %s above mark %s in chat %s has no filename "
+                    "(transfer_state %s); not bound to %s, ignored",
+                    row[0], after_rowid, chat_id, row[1], expected_base,
+                )
+        row = by_path or by_name
     if row is None:
         return None
     return {
@@ -1212,10 +1226,12 @@ def wait_for_attachment_transfer(
 
     after_rowid is the chat's attachment high-water mark read before the send
     (read_attachment_high_water); only rows above it count. expected_path is
-    the file this send handed to Messages; the row must be bound to it (see
-    _query_outgoing_attachment_for_send). Without them the wait falls back to
-    the date filter alone, which a completed row from the preceding two
-    seconds can satisfy; the route always passes both.
+    the file this send handed to Messages; the row must be bound to it by
+    name (see _query_outgoing_attachment_for_send), and a new row with no
+    filename never authorizes "sent" or "failed" for this request: it stays
+    "missing" until the row gains the expected name. Without them the wait
+    falls back to the date filter alone, which a completed row from the
+    preceding two seconds can satisfy; the route always passes both.
 
     Returns {"outcome": ..., "detail": ..., **row fields}. outcome is one of:
       "sent"     transfer_state reached ATTACHMENT_TRANSFER_DONE
@@ -1233,10 +1249,12 @@ def wait_for_attachment_transfer(
 
     deadline = now() + timeout_s
     last = None
+    observed_unnamed = set()
     while True:
         try:
             last = _query_outgoing_attachment_for_send(
-                db_path, chat_id, after_apple_ns, after_rowid, expected_path
+                db_path, chat_id, after_apple_ns, after_rowid, expected_path,
+                observed_unnamed=observed_unnamed,
             )
         except sqlite3.Error as e:
             return {"outcome": "error", "detail": "chat.db read failed: %s" % e}
