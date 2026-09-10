@@ -273,7 +273,7 @@ Use `attachment_b64` unless the caller and the bridge are the same machine.
 
 `attachment_sent: true` is never returned for a transfer chat.db did not mark finished. A 502 with `text_sent: true` means the text half went out as its own message before the picture failed. `/healthz` counts both outcomes in `send_stats.attachment_sent` and `send_stats.attachment_failed`.
 
-`staged_file_kept: true` means Messages referenced the staged file directly instead of copying it into its own store, so the bridge left the `0600` file in place rather than orphan the transcript row on the Mac.
+`staged_file_kept: true` means Messages referenced the staged file directly instead of copying it into its own store, so the bridge left the `0600` file in place rather than orphan the transcript row on the Mac. On macOS 15.7.4 this is what happens every time (live test 2026-09-09: the delivered row's `filename` was the staged path), so expect one file per sent picture to accumulate in the outbox, the same way Messages keeps its own copies of every attachment. The bridge deletes the staged file only when the send fails or Messages made its own copy.
 
 ```
 bridge_curl -X POST http://BRIDGE_HOST:8432/send \
