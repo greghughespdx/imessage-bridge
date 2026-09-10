@@ -251,6 +251,8 @@ Content-Type: application/json
 
 Returns `{"status": "sent", "applescript_elapsed_s": 0.42, "attachment_sent": false}` on success. The `chat_id` is the iMessage chat GUID. You can find it in the `chat_guid` field of received messages.
 
+For a text-only send, "success" means Messages.app accepted the AppleScript. chat.db's `is_sent` flag is not consulted: on 2026-09-09 it stayed 0 on texts that had already arrived on the phone.
+
 **Send a message with an image:**
 
 `/send` takes one optional image. Two mutually exclusive shapes:
@@ -258,9 +260,20 @@ Returns `{"status": "sent", "applescript_elapsed_s": 0.42, "attachment_sent": fa
 | Field | With | Meaning |
 |-------|------|---------|
 | `attachment_path` | - | An absolute path **on the bridge host**. Nothing is copied and nothing is deleted. |
-| `attachment_b64` | `attachment_name` | The image bytes, base64. The bridge writes them to a `0600` file in its own outbox directory, sends it, then deletes it. |
+| `attachment_b64` | `attachment_name` | The image bytes, base64. The bridge writes them to a `0600` file in its own outbox directory (inside `~/Library/Messages/Attachments/`, the one place the sandboxed Messages.app is allowed to read from), sends it, then deletes it once the transfer is confirmed. |
 
 Use `attachment_b64` unless the caller and the bridge are the same machine.
+
+**An attachment send is confirmed against chat.db, not against osascript.** After the AppleScript returns, the bridge polls chat.db for the new outgoing attachment row and holds the response until its `transfer_state` is final, up to `IMESSAGE_BRIDGE_ATTACHMENT_TIMEOUT_S` (default 30s):
+
+| Result | HTTP | Body |
+|--------|------|------|
+| `transfer_state` reached 5 | 200 | `{"status": "sent", "attachment_sent": true, "attachment_transfer_state": 5, "attachment_confirm_s": 1.5, "staged_file_kept": false, ...}` |
+| `transfer_state` reached 6, no row appeared, still in flight at the timeout, or chat.db unreadable | 502 | `{"status": "attachment_failed", "error": "attachment not delivered: ...", "attachment_outcome": "failed" \| "missing" \| "timeout" \| "error", "attachment_sent": false, "text_sent": true/false, "attachment_transfer_state": 6/null, ...}` |
+
+`attachment_sent: true` is never returned for a transfer chat.db did not mark finished. A 502 with `text_sent: true` means the text half went out as its own message before the picture failed. `/healthz` counts both outcomes in `send_stats.attachment_sent` and `send_stats.attachment_failed`.
+
+`staged_file_kept: true` means Messages referenced the staged file directly instead of copying it into its own store, so the bridge left the `0600` file in place rather than orphan the transcript row on the Mac.
 
 ```
 bridge_curl -X POST http://BRIDGE_HOST:8432/send \
@@ -311,7 +324,8 @@ The installer also reads `IMESSAGE_BRIDGE_PORT` and `IMESSAGE_BRIDGE_NAME` envir
 |----------------------|---------|-------------|
 | `IMESSAGE_BRIDGE_LOG` | /usr/local/var/log/imessage-bridge-app.log | Rotating application log |
 | `IMESSAGE_BRIDGE_TOKEN_FILE` | ~/.config/imessage-bridge/token | Shared secret for the `X-Bridge-Token` header. Must be `0600`. Read by the bridge AND by every client. |
-| `IMESSAGE_BRIDGE_OUTBOX_DIR` | ~/.imessage-bridge/outbox | Where `attachment_b64` uploads are staged before sending. Files are `0600` and deleted after the send. Messages.app must be able to read this path. The directory is checked on every staged send, not only when it is created: it must be a directory owned by the bridge's own user (anything else is refused with an error), and any group or world bits are chmod'ed away to `0700` first, with a warning in the log naming the old mode. |
+| `IMESSAGE_BRIDGE_OUTBOX_DIR` | ~/Library/Messages/Attachments/imessage-bridge-outbox | Where `attachment_b64` uploads are staged before sending. Files are `0600` and deleted once chat.db confirms the transfer. Messages.app is sandboxed and can only read paths its entitlements grant (`~/Library/Messages/`, `~/Media/`, `~/Downloads`, a few caches); the old default `~/.imessage-bridge/outbox` was outside that grant and every picture sent from it failed with `transfer_state` 6 (mc-am50p, 2026-09-09). Keep any override inside the grant. The directory is checked on every staged send, not only when it is created: it must be a directory owned by the bridge's own user (anything else is refused with an error), and any group or world bits are chmod'ed away to `0700` first, with a warning in the log naming the old mode. |
+| `IMESSAGE_BRIDGE_ATTACHMENT_TIMEOUT_S` | 30 | How long `POST /send` waits for the attachment row in chat.db to reach a final `transfer_state` before answering 502. |
 | `IMESSAGE_ATTACHMENTS_DIR` | ~/Library/Messages/Attachments | Base directory inbound attachments must live under |
 
 ## Multiple bridges on one network

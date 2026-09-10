@@ -39,12 +39,14 @@ CREATE TABLE chat (ROWID INTEGER PRIMARY KEY, guid TEXT, style INTEGER);
 CREATE TABLE message (
     ROWID INTEGER PRIMARY KEY, guid TEXT, text TEXT, attributedBody BLOB,
     date INTEGER, is_from_me INTEGER, cache_has_attachments INTEGER DEFAULT 0,
-    handle_id INTEGER, service TEXT
+    handle_id INTEGER, service TEXT, is_sent INTEGER DEFAULT 0,
+    error INTEGER DEFAULT 0
 );
 CREATE TABLE chat_message_join (chat_id INTEGER, message_id INTEGER);
 CREATE TABLE attachment (
     ROWID INTEGER PRIMARY KEY, guid TEXT, filename TEXT, mime_type TEXT,
-    transfer_name TEXT, uti TEXT, total_bytes INTEGER
+    transfer_name TEXT, uti TEXT, total_bytes INTEGER,
+    transfer_state INTEGER DEFAULT 0, is_outgoing INTEGER DEFAULT 0
 );
 CREATE TABLE message_attachment_join (message_id INTEGER, attachment_id INTEGER);
 """
@@ -68,22 +70,35 @@ class BuildSendScriptTest(unittest.TestCase):
         self.assertEqual(
             lines,
             [
+                'set theAttachment to (POSIX file "/tmp/pic.png") as alias',
                 'tell application "Messages"',
                 'set targetChat to chat id "chat-x"',
                 'send "look at this" to targetChat',
-                'send POSIX file "/tmp/pic.png" to targetChat',
+                "send theAttachment to targetChat",
                 "end tell",
             ],
         )
 
+    def test_file_specifier_is_built_before_the_tell_block(self):
+        # mc-am50p: the alias is resolved by the script itself, outside
+        # Messages' sandbox, and only the resolved object crosses into the
+        # tell block. `POSIX file` must not appear inside it.
+        script = bridge.build_send_script("chat-x", "t", "/tmp/pic.png")
+        lines = script.splitlines()
+        self.assertTrue(lines[0].startswith("set theAttachment to"))
+        self.assertEqual(lines[1], 'tell application "Messages"')
+        inside = "\n".join(lines[2:])
+        self.assertNotIn("POSIX file", inside)
+
     def test_attachment_alone_when_text_is_empty(self):
         script = bridge.build_send_script("chat-x", "", "/tmp/pic.png")
         self.assertNotIn("send \"\" to targetChat", script)
-        self.assertIn('send POSIX file "/tmp/pic.png" to targetChat', script)
+        self.assertIn('(POSIX file "/tmp/pic.png") as alias', script)
+        self.assertIn("send theAttachment to targetChat", script)
 
     def test_quotes_and_backslashes_in_the_path_are_escaped(self):
         script = bridge.build_send_script("chat-x", "", '/tmp/a"b\\c.png')
-        self.assertIn('send POSIX file "/tmp/a\\"b\\\\c.png" to targetChat', script)
+        self.assertIn('(POSIX file "/tmp/a\\"b\\\\c.png") as alias', script)
 
 
 class SendMessageArgvTest(unittest.TestCase):
@@ -347,6 +362,30 @@ class SendRouteTest(unittest.TestCase):
         bridge.send_message = fake_send
         bridge.probe_outgoing_row = lambda *a, **k: None
 
+        # mc-mnvrm: the route now waits on chat.db for the attachment's
+        # transfer_state. Default it to "delivered, copied by Messages"; the
+        # failure tests swap in other outcomes.
+        self._orig_wait = bridge.wait_for_attachment_transfer
+        self.waits = []
+        self.wait_result = {
+            "outcome": "sent",
+            "detail": "transfer_state 5",
+            "transfer_state": 5,
+            "attachment_rowid": 42,
+            "filename": "~/Library/Messages/Attachments/aa/bb/GUID/copy.png",
+        }
+
+        def fake_wait(db_path, chat_id, sent_after_unix_ms, *a, **k):
+            self.waits.append({"db_path": db_path, "chat_id": chat_id})
+            return dict(self.wait_result)
+
+        bridge.wait_for_attachment_transfer = fake_wait
+
+        with bridge._SEND_STATS_LOCK:
+            self._orig_stats = dict(bridge.SEND_STATS)
+            bridge.SEND_STATS["attachment_sent"] = 0
+            bridge.SEND_STATS["attachment_failed"] = 0
+
         handler = bridge.make_handler(self.db_path, TEST_TOKEN)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.port = self.server.server_address[1]
@@ -358,7 +397,23 @@ class SendRouteTest(unittest.TestCase):
         self.server.server_close()
         bridge.send_message = self._orig_send
         bridge.probe_outgoing_row = self._orig_probe
+        bridge.wait_for_attachment_transfer = self._orig_wait
         bridge.OUTBOX_DIR = self._orig_outbox
+        with bridge._SEND_STATS_LOCK:
+            bridge.SEND_STATS.clear()
+            bridge.SEND_STATS.update(self._orig_stats)
+
+    def _stats(self):
+        with bridge._SEND_STATS_LOCK:
+            return dict(bridge.SEND_STATS)
+
+    def _b64_payload(self, text="x"):
+        return {
+            "chat_id": "chat-x",
+            "text": text,
+            "attachment_b64": base64.b64encode(PNG_BYTES).decode("ascii"),
+            "attachment_name": "crop.png",
+        }
 
     def _post(self, payload, token=TEST_TOKEN):
         raw = json.dumps(payload).encode("utf-8")
@@ -484,6 +539,271 @@ class SendRouteTest(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertIn("not valid base64", body["error"])
+
+    # ---- mc-mnvrm: the response follows chat.db, not osascript's exit ----
+
+    def test_text_only_send_never_waits_on_chat_db(self):
+        status, _ = self._post({"chat_id": "chat-x", "text": "hello"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.waits, [])
+
+    def test_confirmed_attachment_is_200_with_the_transfer_state(self):
+        status, body = self._post(self._b64_payload())
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "sent")
+        self.assertTrue(body["attachment_sent"])
+        self.assertEqual(body["attachment_transfer_state"], 5)
+        self.assertFalse(body["staged_file_kept"])
+        self.assertEqual(self.waits[0]["chat_id"], "chat-x")
+        self.assertEqual(self.waits[0]["db_path"], self.db_path)
+        self.assertEqual(self._stats()["attachment_sent"], 1)
+        self.assertEqual(self._stats()["attachment_failed"], 0)
+
+    def test_staged_file_exists_while_the_transfer_is_confirmed(self):
+        # The file has to outlive osascript: Messages reads it during the
+        # transfer. The wait stub observes the outbox at confirmation time.
+        seen = {}
+
+        def fake_wait(db_path, chat_id, sent_after_unix_ms, *a, **k):
+            seen["outbox"] = os.listdir(bridge.OUTBOX_DIR)
+            return dict(self.wait_result)
+
+        bridge.wait_for_attachment_transfer = fake_wait
+        status, _ = self._post(self._b64_payload())
+        self.assertEqual(status, 200)
+        self.assertEqual(len(seen["outbox"]), 1, "staged file was gone before confirmation")
+        self.assertEqual(os.listdir(bridge.OUTBOX_DIR), [], "staged file outlived the send")
+
+    def test_failed_transfer_is_502_never_attachment_sent_true(self):
+        self.wait_result = {
+            "outcome": "failed",
+            "detail": "Messages marked the attachment transfer failed (transfer_state 6, message error 39)",
+            "transfer_state": 6,
+            "attachment_rowid": 7,
+            "filename": "",
+        }
+        status, body = self._post(self._b64_payload(text="the mark"))
+        self.assertEqual(status, 502)
+        self.assertEqual(body["status"], "attachment_failed")
+        self.assertFalse(body["attachment_sent"])
+        self.assertTrue(body["text_sent"])
+        self.assertEqual(body["attachment_outcome"], "failed")
+        self.assertEqual(body["attachment_transfer_state"], 6)
+        self.assertIn("transfer_state 6", body["error"])
+        self.assertEqual(os.listdir(bridge.OUTBOX_DIR), [])
+        stats = self._stats()
+        self.assertEqual(stats["attachment_failed"], 1)
+        self.assertEqual(stats["attachment_sent"], 0)
+        self.assertIn("attachment failed", stats["last_error"])
+
+    def test_missing_row_is_502(self):
+        self.wait_result = {
+            "outcome": "missing",
+            "detail": "no outgoing attachment row appeared in chat.db within 30s",
+        }
+        status, body = self._post(self._b64_payload(text=""))
+        self.assertEqual(status, 502)
+        self.assertEqual(body["attachment_outcome"], "missing")
+        self.assertFalse(body["attachment_sent"])
+        self.assertFalse(body["text_sent"])
+        self.assertIsNone(body["attachment_transfer_state"])
+        self.assertEqual(self._stats()["attachment_failed"], 1)
+
+    def test_in_flight_at_timeout_is_502(self):
+        self.wait_result = {
+            "outcome": "timeout",
+            "detail": "attachment still in flight after 30s (transfer_state 1)",
+            "transfer_state": 1,
+            "attachment_rowid": 9,
+            "filename": "",
+        }
+        status, body = self._post(
+            {"chat_id": "chat-x", "text": "t", "attachment_path": self.png}
+        )
+        self.assertEqual(status, 502)
+        self.assertEqual(body["attachment_outcome"], "timeout")
+        self.assertEqual(body["attachment_transfer_state"], 1)
+        # A caller-supplied host path is never deleted, success or failure.
+        self.assertTrue(os.path.isfile(self.png))
+
+    def test_chat_db_read_error_is_502(self):
+        self.wait_result = {"outcome": "error", "detail": "chat.db read failed: locked"}
+        status, body = self._post(self._b64_payload())
+        self.assertEqual(status, 502)
+        self.assertEqual(body["attachment_outcome"], "error")
+        self.assertEqual(os.listdir(bridge.OUTBOX_DIR), [])
+
+    def test_staged_file_is_kept_when_messages_references_it_directly(self):
+        # If the confirmed row's filename IS our staged file, Messages did not
+        # copy it; deleting it would orphan the transcript row on the Mac.
+        def fake_wait(db_path, chat_id, sent_after_unix_ms, *a, **k):
+            staged = os.path.join(bridge.OUTBOX_DIR, os.listdir(bridge.OUTBOX_DIR)[0])
+            return dict(self.wait_result, filename=staged)
+
+        bridge.wait_for_attachment_transfer = fake_wait
+        status, body = self._post(self._b64_payload())
+        self.assertEqual(status, 200)
+        self.assertTrue(body["staged_file_kept"])
+        self.assertEqual(len(os.listdir(bridge.OUTBOX_DIR)), 1)
+        kept = os.path.join(bridge.OUTBOX_DIR, os.listdir(bridge.OUTBOX_DIR)[0])
+        self.assertEqual(stat.S_IMODE(os.stat(kept).st_mode), 0o600)
+
+    def test_healthz_exposes_the_attachment_counters(self):
+        self._post(self._b64_payload())
+        self.wait_result = {"outcome": "missing", "detail": "none"}
+        self._post(self._b64_payload())
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn.request("GET", "/healthz", headers={bridge.AUTH_HEADER: TEST_TOKEN})
+        resp = conn.getresponse()
+        body = json.loads(resp.read())
+        conn.close()
+        self.assertEqual(body["send_stats"]["attachment_sent"], 1)
+        self.assertEqual(body["send_stats"]["attachment_failed"], 1)
+
+
+def _apple_ns(unix_ms):
+    return bridge.unix_ms_to_apple_ns(unix_ms)
+
+
+class WaitForAttachmentTransferTest(unittest.TestCase):
+    """wait_for_attachment_transfer against a real sqlite file shaped like
+    chat.db. Time is injected so no test sleeps."""
+
+    CHAT = "iMessage;-;self@example.invalid"
+    SENT_AFTER_MS = 1_700_000_000_000
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mc-mnvrm-")
+        self.db_path = os.path.join(self.tmp, "chat.db")
+        self.conn = sqlite3.connect(self.db_path)
+        self.conn.executescript(MINIMAL_SCHEMA)
+        self.conn.execute("INSERT INTO chat (ROWID, guid, style) VALUES (1, ?, 45)", (self.CHAT,))
+        self.conn.execute("INSERT INTO chat (ROWID, guid, style) VALUES (2, 'iMessage;-;other', 45)")
+        self.conn.commit()
+        self.clock = [0.0]
+        self.slept = []
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _now(self):
+        return self.clock[0]
+
+    def _sleep(self, s):
+        self.slept.append(s)
+        self.clock[0] += s
+
+    def _wait(self, timeout_s=10.0):
+        return bridge.wait_for_attachment_transfer(
+            self.db_path, self.CHAT, self.SENT_AFTER_MS,
+            timeout_s=timeout_s, poll_s=0.5, now=self._now, sleep=self._sleep,
+        )
+
+    def _add_row(self, chat_rowid=1, offset_ms=1000, transfer_state=0,
+                 is_outgoing=1, is_from_me=1, filename="~/x.png", error=0,
+                 msg_rowid=None, att_rowid=None):
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT INTO message (ROWID, guid, text, date, is_from_me, is_sent, error) "
+            "VALUES (?, ?, '', ?, ?, 0, ?)",
+            (msg_rowid, "m-%s" % (msg_rowid or "x"), _apple_ns(self.SENT_AFTER_MS + offset_ms), is_from_me, error),
+        )
+        msg_rowid = cur.lastrowid
+        cur.execute("INSERT INTO chat_message_join VALUES (?, ?)", (chat_rowid, msg_rowid))
+        cur.execute(
+            "INSERT INTO attachment (ROWID, guid, filename, transfer_state, is_outgoing) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (att_rowid, "a-%s" % (att_rowid or "x"), filename, transfer_state, is_outgoing),
+        )
+        att_rowid = cur.lastrowid
+        cur.execute("INSERT INTO message_attachment_join VALUES (?, ?)", (msg_rowid, att_rowid))
+        self.conn.commit()
+        return att_rowid
+
+    def _set_state(self, att_rowid, state):
+        self.conn.execute("UPDATE attachment SET transfer_state = ? WHERE ROWID = ?", (state, att_rowid))
+        self.conn.commit()
+
+    def test_done_row_is_sent(self):
+        rowid = self._add_row(transfer_state=5, filename="~/Library/Messages/Attachments/a/b/c.png")
+        result = self._wait()
+        self.assertEqual(result["outcome"], "sent")
+        self.assertEqual(result["attachment_rowid"], rowid)
+        self.assertEqual(result["transfer_state"], 5)
+        self.assertEqual(result["filename"], "~/Library/Messages/Attachments/a/b/c.png")
+        self.assertEqual(self.slept, [])
+
+    def test_failed_row_is_failed_with_the_message_error(self):
+        self._add_row(transfer_state=6, error=39)
+        result = self._wait()
+        self.assertEqual(result["outcome"], "failed")
+        self.assertIn("transfer_state 6", result["detail"])
+        self.assertIn("error 39", result["detail"])
+
+    def test_polls_until_the_state_becomes_final(self):
+        rowid = self._add_row(transfer_state=0)
+        original_sleep = self._sleep
+
+        def sleep_then_finish(s):
+            original_sleep(s)
+            if len(self.slept) == 3:
+                self._set_state(rowid, 5)
+
+        result = bridge.wait_for_attachment_transfer(
+            self.db_path, self.CHAT, self.SENT_AFTER_MS,
+            timeout_s=10.0, poll_s=0.5, now=self._now, sleep=sleep_then_finish,
+        )
+        self.assertEqual(result["outcome"], "sent")
+        self.assertEqual(len(self.slept), 3)
+
+    def test_row_still_in_flight_at_the_deadline_is_timeout(self):
+        self._add_row(transfer_state=1)
+        result = self._wait(timeout_s=2.0)
+        self.assertEqual(result["outcome"], "timeout")
+        self.assertEqual(result["transfer_state"], 1)
+        self.assertIn("2s", result["detail"])
+        self.assertGreaterEqual(self.clock[0], 2.0)
+
+    def test_no_row_at_all_is_missing(self):
+        result = self._wait(timeout_s=1.0)
+        self.assertEqual(result["outcome"], "missing")
+        self.assertNotIn("transfer_state", result)
+
+    def test_ignores_rows_older_than_the_send(self):
+        self._add_row(offset_ms=-5000, transfer_state=5)
+        result = self._wait(timeout_s=1.0)
+        self.assertEqual(result["outcome"], "missing")
+
+    def test_ignores_other_chats_incoming_and_inbound_attachments(self):
+        self._add_row(chat_rowid=2, transfer_state=5)
+        self._add_row(is_from_me=0, transfer_state=5)
+        self._add_row(is_outgoing=0, transfer_state=5)
+        result = self._wait(timeout_s=1.0)
+        self.assertEqual(result["outcome"], "missing")
+
+    def test_newest_row_wins(self):
+        self._add_row(transfer_state=6, att_rowid=10)
+        self._add_row(transfer_state=5, att_rowid=11, offset_ms=2000)
+        result = self._wait()
+        self.assertEqual(result["outcome"], "sent")
+        self.assertEqual(result["attachment_rowid"], 11)
+
+    def test_unreadable_db_is_error(self):
+        result = bridge.wait_for_attachment_transfer(
+            os.path.join(self.tmp, "nope.db"), self.CHAT, self.SENT_AFTER_MS,
+            timeout_s=1.0, poll_s=0.5, now=self._now, sleep=self._sleep,
+        )
+        self.assertEqual(result["outcome"], "error")
+
+    def test_kept_file_detection_expands_tilde_and_realpath(self):
+        staged = os.path.join(self.tmp, "staged.png")
+        with open(staged, "wb") as f:
+            f.write(PNG_BYTES)
+        self.assertTrue(bridge._messages_kept_the_staged_file({"filename": staged}, staged))
+        self.assertFalse(bridge._messages_kept_the_staged_file({"filename": "~/other.png"}, staged))
+        self.assertFalse(bridge._messages_kept_the_staged_file({"filename": ""}, staged))
+        self.assertFalse(bridge._messages_kept_the_staged_file({"outcome": "missing"}, staged))
+        self.assertFalse(bridge._messages_kept_the_staged_file({"filename": staged}, None))
 
 
 if __name__ == "__main__":

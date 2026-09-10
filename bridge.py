@@ -280,7 +280,17 @@ def resolve_bind_address(requested=None) -> str:
 
 
 BRIDGE_STARTED_AT = time.time()
-SEND_STATS = {"sent": 0, "failed": 0, "last_send_at": None, "last_error": None}
+SEND_STATS = {
+    "sent": 0,
+    "failed": 0,
+    "last_send_at": None,
+    "last_error": None,
+    # mc-mnvrm: an attachment send counts here only once chat.db shows the
+    # transfer finished (5) or failed (6, or never appeared). "sent" above
+    # still counts osascript exits, which is not a delivery signal.
+    "attachment_sent": 0,
+    "attachment_failed": 0,
+}
 _SEND_STATS_LOCK = threading.Lock()
 
 # Apple epoch is seconds since 2001-01-01 00:00:00 UTC
@@ -316,14 +326,39 @@ MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 # deleted once osascript returns, success or failure.
 # ---------------------------------------------------------------------------
 
-# Where attachment_b64 uploads are staged. Kept under the user's home rather
-# than the system temp dir because Messages.app has to be able to read the file
-# it is told to send.
+# Where attachment_b64 uploads are staged. Messages.app is sandboxed
+# (com.apple.security.app-sandbox in its entitlements on macOS 15.7.4), and
+# the only home-relative paths it may read and write are the ones in
+# com.apple.security.temporary-exception.files.home-relative-path.read-write:
+# /Library/Messages/, /Media/, /Library/SMS/ and a few caches, plus ~/Downloads
+# via files.downloads.read-write. The first outbox, ~/.imessage-bridge/outbox,
+# is outside every one of those, and a file sent from there produced an
+# attachment row that Messages could never read: transfer_state 6, the
+# picture never left the Mac (mc-am50p, 2026-09-09). So the outbox lives
+# inside the grant, in its own subdirectory of the Messages attachment store.
 OUTBOX_DIR = os.path.realpath(
     os.path.expanduser(
-        os.environ.get("IMESSAGE_BRIDGE_OUTBOX_DIR", "~/.imessage-bridge/outbox")
+        os.environ.get(
+            "IMESSAGE_BRIDGE_OUTBOX_DIR",
+            "~/Library/Messages/Attachments/imessage-bridge-outbox",
+        )
     )
 )
+
+# chat.db attachment.transfer_state values seen on a real Messages install:
+# 5 on every attachment that reached the other side, 6 on every one that did
+# not (mc-am50p evidence, 2026-09-09). Anything else is "still in flight".
+ATTACHMENT_TRANSFER_DONE = 5
+ATTACHMENT_TRANSFER_FAILED = 6
+
+# How long POST /send waits for the attachment row to reach a final
+# transfer_state before it reports the send as failed (mc-mnvrm). A 521 byte
+# PNG reached state 6 in under 3s; a real photo needs to upload, so the
+# default leaves room. Overridable for tests and slow links.
+ATTACHMENT_CONFIRM_TIMEOUT_S = float(
+    os.environ.get("IMESSAGE_BRIDGE_ATTACHMENT_TIMEOUT_S", "30")
+)
+ATTACHMENT_CONFIRM_POLL_S = 0.5
 
 # Outbound is images only, matching the inbound rule ("Only image attachments
 # are served"). mimetypes on Apple's 3.9 does not know HEIC, so the extension
@@ -852,14 +887,20 @@ def build_send_script(chat_id: str, text: str, attachment_path=None) -> str:
             f'to chat id "{escaped_chat_id}"'
         )
 
+    # The file specifier is built OUTSIDE the tell block, as an alias, so the
+    # reference Messages receives is a resolved file object and not a string
+    # it has to interpret inside its own sandbox. `as alias` also fails the
+    # script cleanly (exit 1, "File ... wasn't found") if the path is gone,
+    # instead of handing Messages a dangling reference.
+    escaped_path = escape_applescript_string(attachment_path)
     lines = [
+        f'set theAttachment to (POSIX file "{escaped_path}") as alias',
         'tell application "Messages"',
         f'    set targetChat to chat id "{escaped_chat_id}"',
     ]
     if text:
         lines.append(f'    send "{escape_applescript_string(text)}" to targetChat')
-    escaped_path = escape_applescript_string(attachment_path)
-    lines.append(f'    send POSIX file "{escaped_path}" to targetChat')
+    lines.append("    send theAttachment to targetChat")
     lines.append("end tell")
     return "\n".join(lines)
 
@@ -951,6 +992,129 @@ def probe_outgoing_row(db_path: str, chat_id: str, sent_after_unix_ms: int) -> N
             log.warning("send-probe error chat=%s: %s", chat_id, e)
 
     threading.Thread(target=_probe, daemon=True).start()
+
+
+def _query_newest_outgoing_attachment(db_path: str, chat_id: str, after_apple_ns: int):
+    """One read-only look at chat.db for the newest outgoing attachment row on
+    an is_from_me message in this chat dated after the send. None if absent."""
+    uri = f"file:{db_path}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        cur = conn.cursor()
+        cur.execute("PRAGMA query_only = ON")
+        cur.execute(
+            """
+            SELECT a.ROWID, a.transfer_state, a.filename, m.ROWID, m.is_sent, m.error
+            FROM attachment a
+            JOIN message_attachment_join maj ON maj.attachment_id = a.ROWID
+            JOIN message m ON m.ROWID = maj.message_id
+            JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+            JOIN chat c ON cmj.chat_id = c.ROWID
+            WHERE c.guid = ? AND m.is_from_me = 1 AND m.date > ?
+              AND a.is_outgoing = 1
+            ORDER BY a.ROWID DESC LIMIT 1
+            """,
+            (chat_id, after_apple_ns),
+        )
+        row = cur.fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        return None
+    return {
+        "attachment_rowid": row[0],
+        "transfer_state": row[1],
+        "filename": row[2],
+        "message_rowid": row[3],
+        "message_is_sent": row[4],
+        "message_error": row[5],
+    }
+
+
+def wait_for_attachment_transfer(
+    db_path: str,
+    chat_id: str,
+    sent_after_unix_ms: int,
+    timeout_s=None,
+    poll_s=None,
+    now=None,
+    sleep=None,
+) -> dict:
+    """Block until the attachment row for this send reaches a final
+    transfer_state, or the timeout passes (mc-mnvrm).
+
+    osascript exiting 0 means Messages accepted the command, nothing more: on
+    2026-09-09 it exited 0 for two attachments that never left the Mac
+    (transfer_state 6). The only signal that tracked what the phone saw was
+    attachment.transfer_state: 5 for every delivered attachment in chat.db, 6
+    for every failed one. message.is_sent is NOT used: Greg's phone showed
+    texts arriving while chat.db still said is_sent 0.
+
+    Returns {"outcome": ..., "detail": ..., **row fields}. outcome is one of:
+      "sent"     transfer_state reached ATTACHMENT_TRANSFER_DONE
+      "failed"   transfer_state reached ATTACHMENT_TRANSFER_FAILED
+      "timeout"  a row exists but is still in flight after timeout_s
+      "missing"  no outgoing attachment row appeared within timeout_s
+      "error"    chat.db could not be read
+    Only "sent" is a success.
+    """
+    timeout_s = ATTACHMENT_CONFIRM_TIMEOUT_S if timeout_s is None else timeout_s
+    poll_s = ATTACHMENT_CONFIRM_POLL_S if poll_s is None else poll_s
+    now = time.monotonic if now is None else now
+    sleep = time.sleep if sleep is None else sleep
+    after_apple_ns = unix_ms_to_apple_ns(sent_after_unix_ms)
+
+    deadline = now() + timeout_s
+    last = None
+    while True:
+        try:
+            last = _query_newest_outgoing_attachment(db_path, chat_id, after_apple_ns)
+        except sqlite3.Error as e:
+            return {"outcome": "error", "detail": "chat.db read failed: %s" % e}
+        if last is not None:
+            state = last["transfer_state"]
+            if state == ATTACHMENT_TRANSFER_DONE:
+                return dict(last, outcome="sent", detail="transfer_state 5")
+            if state == ATTACHMENT_TRANSFER_FAILED:
+                return dict(
+                    last,
+                    outcome="failed",
+                    detail="Messages marked the attachment transfer failed "
+                    "(transfer_state 6, message error %s)" % last["message_error"],
+                )
+        if now() >= deadline:
+            break
+        sleep(poll_s)
+
+    if last is None:
+        return {
+            "outcome": "missing",
+            "detail": "no outgoing attachment row appeared in chat.db within %.0fs"
+            % timeout_s,
+        }
+    return dict(
+        last,
+        outcome="timeout",
+        detail="attachment still in flight after %.0fs (transfer_state %s)"
+        % (timeout_s, last["transfer_state"]),
+    )
+
+
+def _messages_kept_the_staged_file(row, staged_path) -> bool:
+    """True when the attachment row still points at our staged file, meaning
+    Messages did not copy it into its own store and the transcript on this
+    Mac would lose the image if we deleted it."""
+    if not row or not staged_path:
+        return False
+    filename = row.get("filename")
+    if not filename:
+        return False
+    try:
+        return os.path.realpath(_expand_attachment_path(filename)) == os.path.realpath(
+            staged_path
+        )
+    except (OSError, ValueError):
+        return False
 
 
 class BridgeHandler(BaseHTTPRequestHandler):
@@ -1221,19 +1385,83 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 SEND_STATS["failed"] += 1
                 SEND_STATS["last_error"] = "osascript timeout after 60s"
             log.error("send TIMEOUT chat=%s (osascript >60s)", chat_id)
+            discard_staged_attachment(staged_path)
             self.send_error_json(500, "AppleScript timed out after 60s")
             return
         except RuntimeError as e:
+            discard_staged_attachment(staged_path)
             self.send_error_json(500, str(e))
             return
-        finally:
+
+        if send_path is None:
+            probe_outgoing_row(self.db_path, chat_id, sent_at_ms)
+            self.send_json(200, {
+                "status": "sent",
+                "applescript_elapsed_s": round(elapsed, 2),
+                "attachment_sent": False,
+            })
+            return
+
+        # mc-mnvrm: osascript exit 0 is not delivery. Hold the response, and
+        # the staged file, until chat.db shows the transfer finished or failed.
+        # The file must outlive this wait: Messages reads it during the
+        # transfer, not at the moment the AppleScript returns.
+        t1 = time.monotonic()
+        result = wait_for_attachment_transfer(self.db_path, chat_id, sent_at_ms)
+        confirm_elapsed = time.monotonic() - t1
+        kept = _messages_kept_the_staged_file(result, staged_path)
+        if result["outcome"] == "sent" and kept:
+            # The transcript row on this Mac points at our file. Deleting it
+            # would orphan that row, so it stays: 0600, inside the Messages
+            # attachment store, exactly where Messages keeps its own copies.
+            log.info(
+                "attachment confirmed chat=%s transfer_state=5 confirm=%.1fs "
+                "staged file kept (Messages references it directly)",
+                chat_id, confirm_elapsed,
+            )
+        else:
             discard_staged_attachment(staged_path)
 
-        probe_outgoing_row(self.db_path, chat_id, sent_at_ms)
-        self.send_json(200, {
-            "status": "sent",
+        if result["outcome"] == "sent":
+            with _SEND_STATS_LOCK:
+                SEND_STATS["attachment_sent"] += 1
+            log.info(
+                "attachment ok chat=%s transfer_state=5 confirm=%.1fs "
+                "attachment_rowid=%s",
+                chat_id, confirm_elapsed, result.get("attachment_rowid"),
+            )
+            self.send_json(200, {
+                "status": "sent",
+                "applescript_elapsed_s": round(elapsed, 2),
+                "attachment_sent": True,
+                "attachment_transfer_state": ATTACHMENT_TRANSFER_DONE,
+                "attachment_confirm_s": round(confirm_elapsed, 1),
+                "staged_file_kept": bool(staged_path) and kept,
+            })
+            return
+
+        detail = result["detail"]
+        with _SEND_STATS_LOCK:
+            SEND_STATS["attachment_failed"] += 1
+            SEND_STATS["last_error"] = ("attachment %s: %s" % (result["outcome"], detail))[:300]
+        log.error(
+            "attachment %s chat=%s confirm=%.1fs transfer_state=%s "
+            "attachment_rowid=%s: %s",
+            result["outcome"].upper(), chat_id, confirm_elapsed,
+            result.get("transfer_state"), result.get("attachment_rowid"), detail,
+        )
+        # 502: the bridge did its part, the thing behind it (Messages.app) did
+        # not deliver. The text half, when there was one, went out as its own
+        # message before the attachment, so the caller is told that too.
+        self.send_json(502, {
+            "status": "attachment_failed",
+            "error": "attachment not delivered: %s" % detail,
+            "attachment_outcome": result["outcome"],
             "applescript_elapsed_s": round(elapsed, 2),
-            "attachment_sent": send_path is not None,
+            "text_sent": bool(text),
+            "attachment_sent": False,
+            "attachment_transfer_state": result.get("transfer_state"),
+            "attachment_confirm_s": round(confirm_elapsed, 1),
         })
 
 
