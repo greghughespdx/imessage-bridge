@@ -16,6 +16,7 @@ import logging
 import os
 import sqlite3
 import stat
+import subprocess
 import tempfile
 import threading
 import time
@@ -644,6 +645,29 @@ class SendRouteTest(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertIn("not valid base64", body["error"])
 
+    def test_every_pre_send_validation_and_staging_error_is_retry_safe(self):
+        # mc-vhnq7 review (Richard, third pass): remote-send.ts now retries a
+        # /send error ONLY when the body says "retry_safe": true. Every error
+        # that can happen before osascript ever runs - nothing was sent -
+        # must carry it, or a caller using that contract would wrongly give
+        # up on a request it could safely retry.
+        cases = [
+            ({"chat_id": "chat-x"}, 400),  # missing text
+            ({"chat_id": "chat-x", "text": ""}, 400),  # nothing to send
+            ({"chat_id": "chat-x", "text": "x", "attachment_path": "pic.png"}, 400),  # relative path
+            (
+                {
+                    "chat_id": "chat-x", "text": "x",
+                    "attachment_b64": "!!! not base64 !!!", "attachment_name": "crop.png",
+                },
+                400,  # bad base64 (staging)
+            ),
+        ]
+        for payload, expected_status in cases:
+            status, body = self._post(payload)
+            self.assertEqual(status, expected_status, payload)
+            self.assertTrue(body.get("retry_safe"), (payload, body))
+
     # ---- mc-mnvrm: the response follows chat.db, not osascript's exit ----
 
     def test_text_only_send_waits_on_the_message_row_not_the_attachment_wait(self):
@@ -735,6 +759,101 @@ class SendRouteTest(unittest.TestCase):
         self.assertEqual(self.sends, [], "osascript ran without a baseline")
         self.assertEqual(self.text_waits, [])
         self.assertEqual(self._stats()["text_failed"], 1)
+
+    # ---- osascript itself fails, but may have already submitted the text
+    # (mc-vhnq7 review, Richard): a flat 500 here let remote-send.ts retry
+    # under its default attempts and risk a double-send. A reported
+    # osascript failure now falls through to the SAME chat.db confirmation a
+    # clean exit would run, against the SAME pre-send high-water mark. ----
+
+    def test_osascript_timeout_with_the_row_present_is_200_sent(self):
+        def timing_out_send(chat_id, text, attachment_path=None):
+            self.sends.append({"chat_id": chat_id, "text": text})
+            raise subprocess.TimeoutExpired(cmd=["osascript"], timeout=60)
+
+        bridge.send_message = timing_out_send
+        # self.text_wait_result defaults to "sent" (see setUp) - the row
+        # landed even though osascript itself timed out.
+        status, body = self._post({"chat_id": "chat-x", "text": "hello"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["status"], "sent")
+        self.assertEqual(len(self.text_waits), 1)
+        self.assertEqual(self._stats()["text_confirmed"], 1)
+
+    def test_osascript_timeout_with_no_row_is_504_text_unconfirmed(self):
+        def timing_out_send(chat_id, text, attachment_path=None):
+            self.sends.append({"chat_id": chat_id, "text": text})
+            raise subprocess.TimeoutExpired(cmd=["osascript"], timeout=60)
+
+        bridge.send_message = timing_out_send
+        self.text_wait_result = {
+            "outcome": "unconfirmed",
+            "detail": "no outgoing chat.db row exactly matching this text appeared within 30s",
+        }
+        status, body = self._post({"chat_id": "chat-x", "text": "hello"})
+        self.assertEqual(status, 504)
+        self.assertEqual(body["status"], "text_unconfirmed")
+        self.assertFalse(body["retry_safe"])
+        self.assertEqual(self._stats()["text_unconfirmed"], 1)
+        self.assertEqual(self._stats()["text_failed"], 0)
+
+    def test_osascript_nonzero_exit_with_no_row_is_504_text_unconfirmed(self):
+        def failing_send(chat_id, text, attachment_path=None):
+            self.sends.append({"chat_id": chat_id, "text": text})
+            raise RuntimeError("AppleScript failed (exit 1): Messages got an error")
+
+        bridge.send_message = failing_send
+        self.text_wait_result = {
+            "outcome": "unconfirmed",
+            "detail": "no outgoing chat.db row exactly matching this text appeared within 30s",
+        }
+        status, body = self._post({"chat_id": "chat-x", "text": "hello"})
+        self.assertEqual(status, 504)
+        self.assertEqual(body["status"], "text_unconfirmed")
+        self.assertFalse(body["retry_safe"])
+        self.assertEqual(len(self.text_waits), 1, "the confirm wait still ran despite the non-zero exit")
+        self.assertEqual(self._stats()["text_unconfirmed"], 1)
+
+    def test_osascript_nonzero_exit_with_a_matched_failed_row_is_502_text_failed(self):
+        def failing_send(chat_id, text, attachment_path=None):
+            self.sends.append({"chat_id": chat_id, "text": text})
+            raise RuntimeError("AppleScript failed (exit 1): Messages got an error")
+
+        bridge.send_message = failing_send
+        self.text_wait_result = {
+            "outcome": "failed",
+            "detail": "Messages marked the text failed (message error 22)",
+            "message_rowid": 7,
+            "is_sent": 0,
+            "error": 22,
+        }
+        status, body = self._post({"chat_id": "chat-x", "text": "hello"})
+        self.assertEqual(status, 502)
+        self.assertEqual(body["status"], "text_failed")
+        self.assertTrue(body["retry_safe"])
+        self.assertEqual(self._stats()["text_failed"], 1)
+
+    def test_osascript_nonzero_exit_on_an_attachment_send_is_still_a_flat_500(self):
+        # Scope check: only the text-only path got the confirm-anyway
+        # treatment above. An attachment send with no review finding behind
+        # it keeps answering 500 immediately, and its staged file is still
+        # discarded right away.
+        def failing_send(chat_id, text, attachment_path=None):
+            self.sends.append({"attachment_path": attachment_path})
+            raise RuntimeError("AppleScript failed (exit 1): boom")
+
+        bridge.send_message = failing_send
+        status, body = self._post(
+            {
+                "chat_id": "chat-x",
+                "text": "x",
+                "attachment_b64": base64.b64encode(PNG_BYTES).decode("ascii"),
+                "attachment_name": "crop.png",
+            }
+        )
+        self.assertEqual(status, 500)
+        self.assertEqual(self.text_waits, [], "the text confirm wait must not run for an attachment send")
+        self.assertFalse(os.path.exists(self.sends[0]["attachment_path"]))
 
     def test_confirmed_attachment_is_200_with_the_transfer_state(self):
         status, body = self._post(self._b64_payload())
@@ -884,6 +1003,7 @@ class SendRouteTest(unittest.TestCase):
         self.assertEqual(body["attachment_outcome"], "error")
         self.assertFalse(body["text_sent"])
         self.assertFalse(body["attachment_sent"])
+        self.assertTrue(body["retry_safe"])
         self.assertEqual(self.sends, [], "osascript ran without a baseline")
         self.assertEqual(self.waits, [])
         self.assertEqual(os.listdir(bridge.OUTBOX_DIR), [])

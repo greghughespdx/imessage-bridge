@@ -1506,8 +1506,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def send_error_json(self, status: int, message: str) -> None:
-        self.send_json(status, {"error": message})
+    def send_error_json(self, status: int, message: str, **extra) -> None:
+        # mc-vhnq7 (Richard's third-pass review): extra fields let a /send
+        # error opt into "retry_safe": true without a bespoke send_json call
+        # at every pre-osascript validation/staging site. Every other route
+        # (and every /send error that omits extra) is byte-for-byte what it
+        # was: {"error": message}.
+        payload = {"error": message}
+        payload.update(extra)
+        self.send_json(status, payload)
 
     def require_token(self) -> bool:
         """Gate every route on the shared secret (mc-btl9u).
@@ -1682,16 +1689,21 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.send_error_json(404, "Not found")
             return
 
+        # Everything from here down, through the staging block, runs before
+        # osascript - nothing has been sent, so every error response in this
+        # stretch carries "retry_safe": true (mc-vhnq7 review, Richard's
+        # third pass: remote-send.ts now retries a /send error ONLY when the
+        # body says so).
         content_length = int(self.headers.get("Content-Length", 0))
         if content_length == 0:
-            self.send_error_json(400, "Empty request body")
+            self.send_error_json(400, "Empty request body", retry_safe=True)
             return
 
         try:
             raw = self.rfile.read(content_length)
             body = json.loads(raw.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            self.send_error_json(400, f"Invalid JSON body: {e}")
+            self.send_error_json(400, f"Invalid JSON body: {e}", retry_safe=True)
             return
 
         chat_id = body.get("chat_id")
@@ -1701,11 +1713,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
         attachment_name = body.get("attachment_name")
 
         if not chat_id:
-            self.send_error_json(400, "Missing required field: chat_id")
+            self.send_error_json(400, "Missing required field: chat_id", retry_safe=True)
             return
         if attachment_path is not None and attachment_b64 is not None:
             self.send_error_json(
-                400, "Pass attachment_path or attachment_b64, not both"
+                400, "Pass attachment_path or attachment_b64, not both", retry_safe=True
             )
             return
 
@@ -1714,14 +1726,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
         # existing text-only caller still gets the old 400 on a missing field.
         if text is None:
             if not has_attachment:
-                self.send_error_json(400, "Missing required field: text")
+                self.send_error_json(400, "Missing required field: text", retry_safe=True)
                 return
             text = ""
         if not isinstance(text, str):
-            self.send_error_json(400, "Field 'text' must be a string")
+            self.send_error_json(400, "Field 'text' must be a string", retry_safe=True)
             return
         if not text and not has_attachment:
-            self.send_error_json(400, "Nothing to send: text is empty and no attachment")
+            self.send_error_json(
+                400, "Nothing to send: text is empty and no attachment", retry_safe=True
+            )
             return
 
         # Staged bytes get deleted once osascript returns, success or failure.
@@ -1739,12 +1753,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
             else:
                 send_path = None
         except AttachmentRejected as e:
-            self.send_error_json(400, str(e))
+            self.send_error_json(400, str(e), retry_safe=True)
             return
         except (OSError, RuntimeError) as e:
             log.error("staging attachment failed chat=%s: %s", chat_id, e)
             discard_staged_attachment(staged_path)
-            self.send_error_json(500, "Cannot stage attachment")
+            self.send_error_json(500, "Cannot stage attachment", retry_safe=True)
             return
 
         # Every confirmed send - attachment or text-only (mc-vhnq7) - holds
@@ -1775,6 +1789,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         "attachment_sent": False,
                         "attachment_transfer_state": None,
                         "attachment_confirm_s": 0.0,
+                        # Definite failure: osascript never ran, nothing was
+                        # sent, so a retry carries no duplicate-send risk
+                        # (mirrors the text branch's pre-send error below).
+                        "retry_safe": True,
                     })
                     return
             else:
@@ -1803,27 +1821,61 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     return
 
             sent_at_ms = int(time.time() * 1000) - 2000  # 2s slack for clock/db skew
+            t_osa = time.monotonic()
+            osascript_failure = None
             try:
                 elapsed = send_message(chat_id, str(text), send_path)
             except subprocess.TimeoutExpired:
+                elapsed = time.monotonic() - t_osa
                 with _SEND_STATS_LOCK:
                     SEND_STATS["failed"] += 1
                     SEND_STATS["last_error"] = "osascript timeout after 60s"
                 log.error("send TIMEOUT chat=%s (osascript >60s)", chat_id)
-                discard_staged_attachment(staged_path)
-                self.send_error_json(500, "AppleScript timed out after 60s")
-                return
+                if send_path is not None:
+                    discard_staged_attachment(staged_path)
+                    self.send_error_json(500, "AppleScript timed out after 60s")
+                    return
+                osascript_failure = "AppleScript timed out after 60s"
             except RuntimeError as e:
-                discard_staged_attachment(staged_path)
-                self.send_error_json(500, str(e))
-                return
+                elapsed = time.monotonic() - t_osa
+                if send_path is not None:
+                    discard_staged_attachment(staged_path)
+                    self.send_error_json(500, str(e))
+                    return
+                with _SEND_STATS_LOCK:
+                    SEND_STATS["failed"] += 1
+                    SEND_STATS["last_error"] = str(e)[:300]
+                osascript_failure = str(e)
+
+            if osascript_failure is not None:
+                # mc-vhnq7 review (Richard): osascript can time out, or exit
+                # non-zero, AFTER it already submitted the message to
+                # Messages - the timeout and the exit code are osascript's
+                # own report, not proof of what Messages did. Answering 500
+                # here let a retrying caller double-send (remote-send.ts
+                # retries a flat 500 under its default attempts). So for a
+                # text-only send, a reported osascript failure does not
+                # answer by itself: it falls through to the SAME chat.db
+                # confirmation a clean exit would run, against the SAME
+                # high-water mark read before send_message ran. Only an
+                # attachment send still answers 500 immediately here (no
+                # review finding covers it, and discarding its staged file
+                # as soon as osascript itself failed is unchanged).
+                log.error(
+                    "osascript FAILED chat=%s (%s) - checking chat.db before "
+                    "answering; a text is confirmed by the row, not by "
+                    "osascript's own exit",
+                    chat_id, osascript_failure,
+                )
 
             # osascript exit 0 is not delivery, for text (mc-vhnq7) or for an
             # attachment (mc-mnvrm) - hold the response until chat.db proves
             # a row landed, bound to this request by the high-water mark read
             # above. The staged file, when there is one, must outlive this
             # wait: Messages reads it during the transfer, not at the moment
-            # the AppleScript returns.
+            # the AppleScript returns. For text, this wait runs whether or
+            # not osascript itself reported success (osascript_failure
+            # above) - see the comment there.
             t1 = time.monotonic()
             if send_path is None:
                 result = wait_for_text_message(
@@ -1841,10 +1893,18 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 with _SEND_STATS_LOCK:
                     SEND_STATS["text_confirmed"] += 1
                     SEND_STATS["last_send_at"] = time.time()
-                log.info(
-                    "text ok chat=%s confirm=%.1fs message_rowid=%s",
-                    chat_id, confirm_elapsed, result.get("message_rowid"),
-                )
+                if osascript_failure is not None:
+                    log.warning(
+                        "text ok chat=%s confirm=%.1fs message_rowid=%s despite "
+                        "osascript reporting failure (%s) - the row landed anyway",
+                        chat_id, confirm_elapsed, result.get("message_rowid"),
+                        osascript_failure,
+                    )
+                else:
+                    log.info(
+                        "text ok chat=%s confirm=%.1fs message_rowid=%s",
+                        chat_id, confirm_elapsed, result.get("message_rowid"),
+                    )
                 self.send_json(200, {
                     "status": "sent",
                     "applescript_elapsed_s": round(elapsed, 2),
@@ -1854,6 +1914,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return
 
             detail = result["detail"]
+            if osascript_failure is not None:
+                detail = "%s (osascript also reported failure: %s)" % (
+                    detail, osascript_failure,
+                )
             log.error(
                 "text %s chat=%s confirm=%.1fs: %s",
                 result["outcome"].upper(), chat_id, confirm_elapsed, detail,
@@ -1878,14 +1942,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 })
                 return
 
-            # AMBIGUOUS ("unconfirmed" or "error"): osascript exited 0 and
-            # the bridge could not prove anything landed - not that it
-            # proved nothing did. Messages may still be mid-send, so a
-            # retry carries the same duplicate-visible-iMessage risk as
-            # retrying after a client-side timeout (mc-vhnq7 review,
-            # Richard). 504, not 502: a distinct status the caller can key
-            # on without parsing the body, plus "retry_safe": false for
-            # anything that does read the body.
+            # AMBIGUOUS ("unconfirmed" or "error"): the bridge could not
+            # prove anything landed - not that it proved nothing did. This
+            # is reached whether osascript reported success (the normal
+            # path) or reported a timeout/non-zero exit (osascript_failure
+            # above): either way Messages may still be mid-send, so a retry
+            # carries the same duplicate-visible-iMessage risk as retrying
+            # after a client-side timeout (mc-vhnq7 review, Richard). 504,
+            # not 502: a distinct status the caller can key on without
+            # parsing the body, plus "retry_safe": false for anything that
+            # does read the body.
             with _SEND_STATS_LOCK:
                 SEND_STATS["text_unconfirmed"] += 1
                 SEND_STATS["last_error"] = ("text %s: %s" % (result["outcome"], detail))[:300]
