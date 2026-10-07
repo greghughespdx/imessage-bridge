@@ -10,6 +10,7 @@ Usage:
 import argparse
 import base64
 import binascii
+import hashlib
 import hmac
 import ipaddress
 import json
@@ -324,6 +325,158 @@ def chat_send_lock(chat_id: str) -> threading.Lock:
         if lock is None:
             lock = _CHAT_SEND_LOCKS[chat_id] = threading.Lock()
         return lock
+
+
+# ---------------------------------------------------------------------------
+# Idempotency for POST /send (mc-vhnq7, Richard's review)
+#
+# A caller may retry a /send request after a network-level failure
+# (connection reset, client-side timeout) that leaves it unable to tell
+# whether the bridge ever received or acted on the first attempt - osascript
+# can submit a message and only then have the response lost. Retrying is the
+# right thing to do for availability, but only if the retry cannot cause a
+# second, independent send. The caller supplies a per-logical-send key in the
+# X-Idempotency-Key header (documented in README.md); every attempt at the
+# SAME logical send reuses the SAME key. The bridge then guarantees: the
+# first request to use a key runs the real send; every later request with
+# that key - concurrent or sequential - gets that SAME request's outcome
+# (waiting for it if it is still in flight) instead of running osascript
+# again. A key reused with a different chat_id, text, or attachment is
+# refused (409) rather than silently answering for the wrong content.
+# ---------------------------------------------------------------------------
+
+IDEMPOTENCY_HEADER = "X-Idempotency-Key"
+
+# Bounded so a client that forgets to stop sending keys cannot grow this
+# without limit: entries older than this, or beyond this count, are dropped.
+# ONLY a completed entry is ever dropped this way (Richard's review) - an
+# in-flight one is never evicted by age or capacity, no matter how long its
+# send is taking; only the request that owns it finishing removes it from
+# contention for the cap. A bridge restart clears the map entirely (see
+# README) - that is a separate, accepted exposure, not what these bounds
+# are for.
+IDEMPOTENCY_TTL_S = 15 * 60
+IDEMPOTENCY_MAX_ENTRIES = 500
+
+# How long a second request with the same key waits for the first one's
+# outcome before giving up. Matches the bridge's own worst-case send+confirm
+# envelope (60s osascript + 30s chat.db confirm) plus margin - the same
+# budget remote-send.ts's own SEND_TIMEOUT_MS reserves for one attempt - so a
+# waiter does not give up on an owner that is still well within its normal
+# run. Giving up here NEVER means starting a second osascript call: it means
+# answering "unconfirmed" and leaving the owner to keep running.
+IDEMPOTENCY_WAIT_TIMEOUT_S = 100.0
+
+_IDEMPOTENCY_LOCK = threading.Lock()
+# key -> {"identity", "event", "status", "payload", "created_at"}. A plain
+# dict: Python payload dicts preserve insertion order, which is all the
+# capacity eviction below needs (oldest-completed-first).
+_IDEMPOTENCY_KEYS = {}
+
+
+def attachment_identity(attachment_path, attachment_b64, attachment_name):
+    """A value equal for two requests only if they name the same attachment
+    (mc-vhnq7 review: the idempotency key binds to chat, exact text, AND
+    attachment identity - not just chat and text).
+
+    attachment_path is compared by its exact given value (not resolved -
+    validate_outbound_attachment's own checks run on it regardless). An
+    attachment_b64 upload is identified by its bytes and name, not by
+    decoding and re-encoding: a sha256 of the base64 TEXT the caller sent is
+    already a content fingerprint, since equal base64 text decodes to equal
+    bytes. None (no attachment) is itself a valid, comparable identity.
+    """
+    if attachment_path is not None:
+        return ("path", attachment_path)
+    if attachment_b64 is not None:
+        digest = hashlib.sha256(attachment_b64.encode("utf-8", "surrogatepass")).hexdigest()
+        return ("b64", attachment_name, digest)
+    return None
+
+
+def _idempotency_evict_locked(now) -> None:
+    """Drop only COMPLETED entries (event already set): first anything past
+    the TTL, then, if still over the cap, the oldest completed entries until
+    back under it. An in-flight entry is skipped by both passes regardless
+    of its age - see the module comment above. Caller holds
+    _IDEMPOTENCY_LOCK."""
+    expired = [
+        key for key, entry in _IDEMPOTENCY_KEYS.items()
+        if entry["event"].is_set() and now - entry["created_at"] > IDEMPOTENCY_TTL_S
+    ]
+    for key in expired:
+        del _IDEMPOTENCY_KEYS[key]
+
+    if len(_IDEMPOTENCY_KEYS) > IDEMPOTENCY_MAX_ENTRIES:
+        completed_oldest_first = [
+            key for key, entry in _IDEMPOTENCY_KEYS.items() if entry["event"].is_set()
+        ]
+        for key in completed_oldest_first:
+            if len(_IDEMPOTENCY_KEYS) <= IDEMPOTENCY_MAX_ENTRIES:
+                break
+            del _IDEMPOTENCY_KEYS[key]
+
+
+def idempotency_begin(key: str, identity):
+    """Register this request against an idempotency key, or find out it
+    must wait for - or was refused because of - an earlier one.
+
+    Returns a ("owner", entry) / ("wait", entry) / ("conflict", None) tuple.
+    "owner" means this request is the first to use `key`: the caller runs
+    the real send and must call idempotency_finish(entry, ...) exactly once,
+    however it exits. "wait" means another request already owns `key` with
+    the SAME identity: the caller must idempotency_await(entry) and answer
+    with whatever that returns, and must NOT run its own send. "conflict"
+    means `key` is already bound to a DIFFERENT identity (chat_id, text, or
+    attachment): the caller must answer 409 and send nothing.
+    """
+    now = time.monotonic()
+    with _IDEMPOTENCY_LOCK:
+        _idempotency_evict_locked(now)
+        entry = _IDEMPOTENCY_KEYS.get(key)
+        if entry is None:
+            entry = {
+                "identity": identity,
+                "event": threading.Event(),
+                "status": None,
+                "payload": None,
+                "created_at": now,
+            }
+            _IDEMPOTENCY_KEYS[key] = entry
+            return "owner", entry
+        if entry["identity"] != identity:
+            return "conflict", None
+        return "wait", entry
+
+
+def idempotency_finish(entry, status: int, payload: dict) -> None:
+    """Record this request's final outcome - the EXACT status and body a
+    caller received, a 504 included - and release anyone waiting on it.
+    Called by the owner exactly once, after the real send is fully decided,
+    never while holding _IDEMPOTENCY_LOCK (setting a threading.Event does
+    not need it)."""
+    entry["status"] = status
+    entry["payload"] = payload
+    entry["event"].set()
+
+
+def idempotency_await(entry, timeout=None):
+    """Block for the owning request's outcome, OUTSIDE _IDEMPOTENCY_LOCK
+    (Richard's review: never hold the map lock while waiting on the send or
+    the chat.db confirmation - only a per-key event is held across the
+    wait). Returns the owner's (status, payload) once known.
+
+    Returns None if `timeout` (default IDEMPOTENCY_WAIT_TIMEOUT_S) passes
+    with the owner still working. The caller MUST NOT treat that as license
+    to run its own send - a waiter never starts a second osascript call,
+    even after its own wait gives up (mc-vhnq7 review, Richard): it answers
+    504/unconfirmed and leaves the owner to keep running and eventually
+    finish for the next lookup.
+    """
+    timeout = IDEMPOTENCY_WAIT_TIMEOUT_S if timeout is None else timeout
+    if entry["event"].wait(timeout):
+        return entry["status"], entry["payload"]
+    return None
 
 # Apple epoch is seconds since 2001-01-01 00:00:00 UTC
 # Unix epoch is seconds since 1970-01-01 00:00:00 UTC
@@ -1738,6 +1891,74 @@ class BridgeHandler(BaseHTTPRequestHandler):
             )
             return
 
+        # mc-vhnq7 (Richard's review): from here on, chat_id/text/attachment
+        # are all known, so an idempotency key can be checked against them.
+        # Everything BEFORE this point (missing/malformed fields) is not
+        # tracked - there is no "send" yet to deduplicate, and a caller can
+        # already safely retry those (retry_safe: true above) without a key.
+        idem_entry = None
+        idem_key = self.headers.get(IDEMPOTENCY_HEADER)
+        if idem_key:
+            identity = (chat_id, text, attachment_identity(
+                attachment_path, attachment_b64, attachment_name,
+            ))
+            role, entry = idempotency_begin(idem_key, identity)
+            if role == "conflict":
+                # Different chat_id, text, or attachment under the same key.
+                # Refused outright: nothing is sent, and this is never
+                # retried by a caller that honors retry_safe (there is none
+                # here, which already means "do not retry").
+                log.warning(
+                    "idempotency CONFLICT key=%s chat=%s - key already bound "
+                    "to a different chat/text/attachment",
+                    idem_key, chat_id,
+                )
+                self.send_json(409, {
+                    "status": "idempotency_conflict",
+                    "error": "idempotency key already used for a different "
+                    "chat_id, text, or attachment",
+                })
+                return
+            if role == "wait":
+                outcome = idempotency_await(entry)
+                if outcome is None:
+                    # The owner is still working after our own wait budget.
+                    # Never run our own osascript here - answer ambiguous
+                    # and leave the owner running; a retry with the same key
+                    # will see it resolved by then, or wait again.
+                    log.warning(
+                        "idempotency WAIT TIMEOUT key=%s chat=%s - owner "
+                        "still in flight after %.1fs, answering unconfirmed",
+                        idem_key, chat_id, IDEMPOTENCY_WAIT_TIMEOUT_S,
+                    )
+                    self.send_json(504, {
+                        "status": "text_unconfirmed",
+                        "error": "idempotency key is still in flight from an "
+                        "earlier request; outcome not yet known",
+                        "text_outcome": "unconfirmed",
+                        "text_sent": False,
+                        "attachment_sent": False,
+                        "retry_safe": False,
+                    })
+                    return
+                status, payload = outcome
+                log.info(
+                    "idempotency REPLAY key=%s chat=%s status=%s (from the "
+                    "request that owns this key)",
+                    idem_key, chat_id, status,
+                )
+                self.send_json(status, payload)
+                return
+            # role == "owner": this request runs the real send below and
+            # must record its outcome through respond() for anyone else
+            # waiting on or later reusing this key.
+            idem_entry = entry
+
+        def respond(status, payload):
+            if idem_entry is not None:
+                idempotency_finish(idem_entry, status, payload)
+            self.send_json(status, payload)
+
         # Staged bytes get deleted once osascript returns, success or failure.
         staged_path = None
         try:
@@ -1753,12 +1974,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
             else:
                 send_path = None
         except AttachmentRejected as e:
-            self.send_error_json(400, str(e), retry_safe=True)
+            respond(400, {"error": str(e), "retry_safe": True})
             return
         except (OSError, RuntimeError) as e:
             log.error("staging attachment failed chat=%s: %s", chat_id, e)
             discard_staged_attachment(staged_path)
-            self.send_error_json(500, "Cannot stage attachment", retry_safe=True)
+            respond(500, {"error": "Cannot stage attachment", "retry_safe": True})
             return
 
         # Every confirmed send - attachment or text-only (mc-vhnq7) - holds
@@ -1780,7 +2001,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         SEND_STATS["last_error"] = ("attachment error: %s" % detail)[:300]
                     log.error("attachment ERROR chat=%s (not sent): %s", chat_id, detail)
                     discard_staged_attachment(staged_path)
-                    self.send_json(502, {
+                    respond(502, {
                         "status": "attachment_failed",
                         "error": "attachment not delivered: %s" % detail,
                         "attachment_outcome": "error",
@@ -1807,7 +2028,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         SEND_STATS["text_failed"] += 1
                         SEND_STATS["last_error"] = ("text error: %s" % detail)[:300]
                     log.error("text ERROR chat=%s (not sent): %s", chat_id, detail)
-                    self.send_json(502, {
+                    respond(502, {
                         "status": "text_failed",
                         "error": "text not confirmed: %s" % detail,
                         "text_outcome": "error",
@@ -1833,14 +2054,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 log.error("send TIMEOUT chat=%s (osascript >60s)", chat_id)
                 if send_path is not None:
                     discard_staged_attachment(staged_path)
-                    self.send_error_json(500, "AppleScript timed out after 60s")
+                    respond(500, {"error": "AppleScript timed out after 60s"})
                     return
                 osascript_failure = "AppleScript timed out after 60s"
             except RuntimeError as e:
                 elapsed = time.monotonic() - t_osa
                 if send_path is not None:
                     discard_staged_attachment(staged_path)
-                    self.send_error_json(500, str(e))
+                    respond(500, {"error": str(e)})
                     return
                 with _SEND_STATS_LOCK:
                     SEND_STATS["failed"] += 1
@@ -1905,7 +2126,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         "text ok chat=%s confirm=%.1fs message_rowid=%s",
                         chat_id, confirm_elapsed, result.get("message_rowid"),
                     )
-                self.send_json(200, {
+                respond(200, {
                     "status": "sent",
                     "applescript_elapsed_s": round(elapsed, 2),
                     "attachment_sent": False,
@@ -1930,7 +2151,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 with _SEND_STATS_LOCK:
                     SEND_STATS["text_failed"] += 1
                     SEND_STATS["last_error"] = ("text failed: %s" % detail)[:300]
-                self.send_json(502, {
+                respond(502, {
                     "status": "text_failed",
                     "error": "text not confirmed: %s" % detail,
                     "text_outcome": "failed",
@@ -1955,7 +2176,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             with _SEND_STATS_LOCK:
                 SEND_STATS["text_unconfirmed"] += 1
                 SEND_STATS["last_error"] = ("text %s: %s" % (result["outcome"], detail))[:300]
-            self.send_json(504, {
+            respond(504, {
                 "status": "text_unconfirmed",
                 "error": "text not confirmed: %s" % detail,
                 "text_outcome": result["outcome"],
@@ -1990,7 +2211,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 "attachment_rowid=%s",
                 chat_id, confirm_elapsed, result.get("attachment_rowid"),
             )
-            self.send_json(200, {
+            respond(200, {
                 "status": "sent",
                 "applescript_elapsed_s": round(elapsed, 2),
                 "attachment_sent": True,
@@ -2013,7 +2234,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         # 502: the bridge did its part, the thing behind it (Messages.app) did
         # not deliver. The text half, when there was one, went out as its own
         # message before the attachment, so the caller is told that too.
-        self.send_json(502, {
+        respond(502, {
             "status": "attachment_failed",
             "error": "attachment not delivered: %s" % detail,
             "attachment_outcome": result["outcome"],

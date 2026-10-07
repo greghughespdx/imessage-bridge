@@ -483,6 +483,12 @@ class SendRouteTest(unittest.TestCase):
             bridge.SEND_STATS["text_failed"] = 0
             bridge.SEND_STATS["text_unconfirmed"] = 0
 
+        # mc-vhnq7 (idempotency): a clean idempotency map per test, so a key
+        # name reused across tests never leaks a stored outcome between them.
+        self._orig_idempotency_keys = dict(bridge._IDEMPOTENCY_KEYS)
+        bridge._IDEMPOTENCY_KEYS.clear()
+        self._orig_idempotency_wait_timeout = bridge.IDEMPOTENCY_WAIT_TIMEOUT_S
+
         handler = bridge.make_handler(self.db_path, TEST_TOKEN)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         self.port = self.server.server_address[1]
@@ -500,6 +506,9 @@ class SendRouteTest(unittest.TestCase):
         with bridge._SEND_STATS_LOCK:
             bridge.SEND_STATS.clear()
             bridge.SEND_STATS.update(self._orig_stats)
+        bridge._IDEMPOTENCY_KEYS.clear()
+        bridge._IDEMPOTENCY_KEYS.update(self._orig_idempotency_keys)
+        bridge.IDEMPOTENCY_WAIT_TIMEOUT_S = self._orig_idempotency_wait_timeout
 
     def _stats(self):
         with bridge._SEND_STATS_LOCK:
@@ -513,12 +522,14 @@ class SendRouteTest(unittest.TestCase):
             "attachment_name": "crop.png",
         }
 
-    def _post(self, payload, token=TEST_TOKEN):
+    def _post(self, payload, token=TEST_TOKEN, idempotency_key=None, timeout=5):
         raw = json.dumps(payload).encode("utf-8")
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
         headers = {"Content-Type": "application/json"}
         if token is not None:
             headers[bridge.AUTH_HEADER] = token
+        if idempotency_key is not None:
+            headers[bridge.IDEMPOTENCY_HEADER] = idempotency_key
         conn.request("POST", "/send", body=raw, headers=headers)
         resp = conn.getresponse()
         body = resp.read()
@@ -1193,6 +1204,166 @@ class SendRouteTest(unittest.TestCase):
         release.set()
         a.join(5)
 
+    # ---- idempotency key (mc-vhnq7, Richard's review) ----
+
+    def test_no_key_means_no_deduplication(self):
+        # "A request without a key behaves exactly as now."
+        status1, _ = self._post({"chat_id": "chat-x", "text": "hello"})
+        status2, _ = self._post({"chat_id": "chat-x", "text": "hello"})
+        self.assertEqual(status1, 200)
+        self.assertEqual(status2, 200)
+        self.assertEqual(len(self.sends), 2, "without a key each request runs its own osascript call")
+
+    def test_same_key_twice_sequentially_runs_osascript_once_with_an_identical_response(self):
+        status1, body1 = self._post({"chat_id": "chat-x", "text": "hello"}, idempotency_key="k-repeat")
+        status2, body2 = self._post({"chat_id": "chat-x", "text": "hello"}, idempotency_key="k-repeat")
+        self.assertEqual(status1, 200)
+        self.assertEqual(status1, status2)
+        self.assertEqual(body1, body2)
+        self.assertEqual(len(self.sends), 1, "a repeat key must not run osascript again")
+        self.assertEqual(self._stats()["text_confirmed"], 1, "the replay must not double-count the outcome")
+
+    def test_repeat_key_replays_the_exact_504_including_its_body(self):
+        # "The stored outcome keeps the exact status and body, including a
+        # 504 marked ambiguous."
+        self.text_wait_result = {
+            "outcome": "unconfirmed",
+            "detail": "no outgoing chat.db row exactly matching this text appeared within 30s",
+        }
+        status1, body1 = self._post({"chat_id": "chat-x", "text": "hello"}, idempotency_key="k-504")
+        status2, body2 = self._post({"chat_id": "chat-x", "text": "hello"}, idempotency_key="k-504")
+        self.assertEqual(status1, 504)
+        self.assertEqual(status1, status2)
+        self.assertEqual(body1, body2)
+        self.assertFalse(body1["retry_safe"])
+        self.assertEqual(len(self.sends), 1, "the replay must not run osascript again")
+
+    def test_key_reuse_with_different_text_is_409_and_not_sent(self):
+        status1, _ = self._post({"chat_id": "chat-x", "text": "hello"}, idempotency_key="k-conflict-text")
+        self.assertEqual(status1, 200)
+        status2, body2 = self._post(
+            {"chat_id": "chat-x", "text": "something else"}, idempotency_key="k-conflict-text"
+        )
+        self.assertEqual(status2, 409)
+        self.assertEqual(body2["status"], "idempotency_conflict")
+        self.assertNotIn("retry_safe", body2, "a 409 must never be marked retry_safe - it is never retried")
+        self.assertEqual(len(self.sends), 1, "the conflicting request must never reach osascript")
+
+    def test_key_reuse_with_different_chat_is_409_and_not_sent(self):
+        status1, _ = self._post({"chat_id": "chat-x", "text": "hello"}, idempotency_key="k-conflict-chat")
+        self.assertEqual(status1, 200)
+        status2, body2 = self._post(
+            {"chat_id": "chat-y", "text": "hello"}, idempotency_key="k-conflict-chat"
+        )
+        self.assertEqual(status2, 409)
+        self.assertEqual(len(self.sends), 1)
+
+    def test_key_reuse_with_a_different_attachment_is_409_and_not_sent(self):
+        # The key binds to attachment identity too, not just chat and text
+        # (Richard's review): a different image under the same key, chat,
+        # and text is still a conflict.
+        status1, _ = self._post(self._b64_payload(text="hello"), idempotency_key="k-conflict-attachment")
+        self.assertEqual(status1, 200)
+        other_payload = {
+            "chat_id": "chat-x",
+            "text": "hello",
+            "attachment_b64": base64.b64encode(PNG_BYTES + b"\x00").decode("ascii"),
+            "attachment_name": "crop.png",
+        }
+        status2, body2 = self._post(other_payload, idempotency_key="k-conflict-attachment")
+        self.assertEqual(status2, 409)
+        self.assertEqual(len(self.sends), 1)
+
+    def test_concurrent_requests_with_the_same_key_share_one_outcome(self):
+        # "A repeat key whose first request is still in flight waits for
+        # that outcome... and returns it." Exercised through a REAL second
+        # thread hitting the REAL HTTP server, not a mocked wait.
+        release = threading.Event()
+        calls = []
+
+        def slow_wait_text(db_path, chat_id, sent_after_unix_ms, expected_text, *a, **k):
+            calls.append(1)
+            release.wait(timeout=10)
+            return dict(self.text_wait_result, text=expected_text)
+
+        bridge.wait_for_text_message = slow_wait_text
+        results = {}
+
+        def post(name):
+            results[name] = self._post(
+                {"chat_id": "chat-x", "text": "hello"}, idempotency_key="k-concurrent", timeout=15,
+            )
+
+        first = threading.Thread(target=post, args=("first",))
+        first.start()
+        self.assertTrue(
+            self._wait_until(lambda: len(calls) == 1, timeout=5),
+            "the owner must have reached the confirm wait before the second request starts",
+        )
+        second = threading.Thread(target=post, args=("second",))
+        second.start()
+        time.sleep(0.2)  # let the second request register as "wait" and block on idempotency_await
+        release.set()
+        first.join(timeout=10)
+        second.join(timeout=10)
+
+        status1, body1 = results["first"]
+        status2, body2 = results["second"]
+        self.assertEqual(status1, 200)
+        self.assertEqual(status1, status2)
+        self.assertEqual(body1, body2)
+        self.assertEqual(len(self.sends), 1, "osascript must run exactly once for two concurrent same-key requests")
+        self.assertEqual(len(calls), 1, "only the owner calls wait_for_text_message; a waiter never starts its own")
+
+    def test_a_waiter_that_times_out_never_sends_and_answers_504(self):
+        # "A waiter must never start a second osascript, even after the
+        # first request times out. It returns the first request's outcome,
+        # or 504 if that is still unknown" (Richard's review). The owner's
+        # own confirm wait is held open past this waiter's own (shortened)
+        # patience, so the waiter must give up with 504 rather than send.
+        bridge.IDEMPOTENCY_WAIT_TIMEOUT_S = 0.2
+        release = threading.Event()
+        calls = []
+
+        def slow_wait_text(db_path, chat_id, sent_after_unix_ms, expected_text, *a, **k):
+            calls.append(1)
+            release.wait(timeout=10)
+            return dict(self.text_wait_result, text=expected_text)
+
+        bridge.wait_for_text_message = slow_wait_text
+        results = {}
+
+        def post(name):
+            results[name] = self._post(
+                {"chat_id": "chat-x", "text": "hello"}, idempotency_key="k-waiter-timeout", timeout=15,
+            )
+
+        owner = threading.Thread(target=post, args=("owner",))
+        owner.start()
+        self.assertTrue(
+            self._wait_until(lambda: len(calls) == 1, timeout=5),
+            "the owner must have reached the confirm wait before the waiter's own wait begins",
+        )
+        status2, body2 = self._post(
+            {"chat_id": "chat-x", "text": "hello"}, idempotency_key="k-waiter-timeout", timeout=15,
+        )
+        self.assertEqual(status2, 504)
+        self.assertEqual(body2["status"], "text_unconfirmed")
+        self.assertFalse(body2["retry_safe"])
+
+        release.set()
+        owner.join(timeout=10)
+        self.assertEqual(len(self.sends), 1, "the waiter giving up must never cause its own osascript call")
+        self.assertEqual(len(calls), 1, "only the owner ever calls wait_for_text_message")
+
+    def _wait_until(self, predicate, timeout=5, poll=0.02):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(poll)
+        return predicate()
+
     def test_healthz_exposes_the_attachment_counters(self):
         self._post(self._b64_payload())
         self.wait_result = {"outcome": "missing", "detail": "none"}
@@ -1690,6 +1861,173 @@ class WaitForTextMessageTest(unittest.TestCase):
         self.assertEqual(bridge.read_message_high_water(self.db_path, self.CHAT), rowid)
         with self.assertRaises(sqlite3.Error):
             bridge.read_message_high_water(os.path.join(self.tmp, "nope.db"), self.CHAT)
+
+
+class AttachmentIdentityTest(unittest.TestCase):
+    """attachment_identity: the value the idempotency key binds attachments
+    to, alongside chat_id and text (mc-vhnq7, Richard's review)."""
+
+    def test_no_attachment_is_a_comparable_none(self):
+        self.assertIsNone(bridge.attachment_identity(None, None, None))
+        self.assertEqual(
+            bridge.attachment_identity(None, None, None),
+            bridge.attachment_identity(None, None, None),
+        )
+
+    def test_attachment_path_identity_is_the_exact_path(self):
+        self.assertEqual(
+            bridge.attachment_identity("/a/b.png", None, None),
+            bridge.attachment_identity("/a/b.png", None, None),
+        )
+        self.assertNotEqual(
+            bridge.attachment_identity("/a/b.png", None, None),
+            bridge.attachment_identity("/a/c.png", None, None),
+        )
+
+    def test_attachment_b64_identity_depends_on_bytes_and_name(self):
+        b64 = base64.b64encode(PNG_BYTES).decode("ascii")
+        other_b64 = base64.b64encode(PNG_BYTES + b"\x00").decode("ascii")
+        self.assertEqual(
+            bridge.attachment_identity(None, b64, "crop.png"),
+            bridge.attachment_identity(None, b64, "crop.png"),
+        )
+        self.assertNotEqual(
+            bridge.attachment_identity(None, b64, "crop.png"),
+            bridge.attachment_identity(None, other_b64, "crop.png"),
+        )
+        self.assertNotEqual(
+            bridge.attachment_identity(None, b64, "crop.png"),
+            bridge.attachment_identity(None, b64, "different.png"),
+        )
+
+    def test_path_and_b64_identities_never_collide(self):
+        b64 = base64.b64encode(PNG_BYTES).decode("ascii")
+        self.assertNotEqual(
+            bridge.attachment_identity("/a/b.png", None, None),
+            bridge.attachment_identity(None, b64, "b.png"),
+        )
+
+
+class IdempotencyTest(unittest.TestCase):
+    """idempotency_begin / idempotency_finish / idempotency_await and the
+    eviction rule, directly - no HTTP server (mc-vhnq7, Richard's review).
+    The HTTP-level behavior (same key twice, concurrent waiters, 409 on a
+    mismatched chat/text/attachment) is covered in SendRouteTest."""
+
+    def setUp(self):
+        self._orig_keys = dict(bridge._IDEMPOTENCY_KEYS)
+        bridge._IDEMPOTENCY_KEYS.clear()
+
+    def tearDown(self):
+        bridge._IDEMPOTENCY_KEYS.clear()
+        bridge._IDEMPOTENCY_KEYS.update(self._orig_keys)
+
+    def test_a_fresh_key_is_owned_by_the_first_caller(self):
+        role, entry = bridge.idempotency_begin("k1", ("chat-x", "hi", None))
+        self.assertEqual(role, "owner")
+        self.assertFalse(entry["event"].is_set())
+
+    def test_the_same_key_and_identity_again_while_in_flight_is_wait(self):
+        role1, entry1 = bridge.idempotency_begin("k2", ("chat-x", "hi", None))
+        role2, entry2 = bridge.idempotency_begin("k2", ("chat-x", "hi", None))
+        self.assertEqual(role1, "owner")
+        self.assertEqual(role2, "wait")
+        self.assertIs(entry1, entry2)
+
+    def test_the_same_key_with_different_text_is_conflict(self):
+        bridge.idempotency_begin("k3", ("chat-x", "hi", None))
+        role, entry = bridge.idempotency_begin("k3", ("chat-x", "bye", None))
+        self.assertEqual(role, "conflict")
+        self.assertIsNone(entry)
+
+    def test_the_same_key_with_a_different_chat_is_also_conflict(self):
+        bridge.idempotency_begin("k4", ("chat-x", "hi", None))
+        role, _ = bridge.idempotency_begin("k4", ("chat-y", "hi", None))
+        self.assertEqual(role, "conflict")
+
+    def test_the_same_key_with_a_different_attachment_is_also_conflict(self):
+        bridge.idempotency_begin("k5", ("chat-x", "hi", ("path", "/a.png")))
+        role, _ = bridge.idempotency_begin("k5", ("chat-x", "hi", ("path", "/b.png")))
+        self.assertEqual(role, "conflict")
+
+    def test_finish_then_begin_returns_wait_with_the_outcome_available_immediately(self):
+        role, entry = bridge.idempotency_begin("k6", ("chat-x", "hi", None))
+        self.assertEqual(role, "owner")
+        bridge.idempotency_finish(entry, 200, {"status": "sent"})
+        role2, entry2 = bridge.idempotency_begin("k6", ("chat-x", "hi", None))
+        self.assertEqual(role2, "wait")
+        self.assertEqual(bridge.idempotency_await(entry2, timeout=1), (200, {"status": "sent"}))
+
+    def test_a_504_outcome_is_stored_and_replayed_exactly(self):
+        # "The stored outcome keeps the exact status and body, including a
+        # 504 marked ambiguous."
+        role, entry = bridge.idempotency_begin("k7", ("chat-x", "hi", None))
+        payload = {"status": "text_unconfirmed", "retry_safe": False, "text_outcome": "unconfirmed"}
+        bridge.idempotency_finish(entry, 504, payload)
+        self.assertEqual(bridge.idempotency_await(entry, timeout=1), (504, payload))
+
+    def test_await_returns_none_on_timeout_when_never_finished(self):
+        # A waiter must never start its own send just because ITS wait gave
+        # up - this is the signal the HTTP layer turns into "answer 504,
+        # never run osascript" (SendRouteTest covers that behavior).
+        role, entry = bridge.idempotency_begin("k8", ("chat-x", "hi", None))
+        self.assertIsNone(bridge.idempotency_await(entry, timeout=0.05))
+        self.assertFalse(entry["event"].is_set(), "a timed-out wait must not mark the entry finished")
+
+    def test_an_in_flight_entry_survives_ttl_expiry(self):
+        now = time.monotonic()
+        bridge._IDEMPOTENCY_KEYS["still-running"] = {
+            "identity": ("chat-x", "hi", None), "event": threading.Event(),
+            "status": None, "payload": None,
+            "created_at": now - bridge.IDEMPOTENCY_TTL_S - 1,  # already past the TTL by age alone
+        }
+        bridge._idempotency_evict_locked(now)
+        self.assertIn(
+            "still-running", bridge._IDEMPOTENCY_KEYS,
+            "an in-flight entry must never be evicted by age",
+        )
+
+    def test_an_in_flight_entry_survives_capacity_eviction(self):
+        now = time.monotonic()
+        bridge._IDEMPOTENCY_KEYS["still-running"] = {
+            "identity": ("chat-x", "hi", None), "event": threading.Event(),
+            "status": None, "payload": None, "created_at": now,
+        }
+        for i in range(bridge.IDEMPOTENCY_MAX_ENTRIES + 10):
+            done = threading.Event()
+            done.set()
+            bridge._IDEMPOTENCY_KEYS["done-%d" % i] = {
+                "identity": ("chat-x", "hi-%d" % i, None), "event": done,
+                "status": 200, "payload": {}, "created_at": now,
+            }
+        bridge._idempotency_evict_locked(now)
+        self.assertIn(
+            "still-running", bridge._IDEMPOTENCY_KEYS,
+            "an in-flight entry must never be evicted by capacity",
+        )
+
+    def test_completed_entries_are_evicted_past_the_ttl(self):
+        now = time.monotonic()
+        done = threading.Event()
+        done.set()
+        bridge._IDEMPOTENCY_KEYS["old-done"] = {
+            "identity": ("chat-x", "hi", None), "event": done,
+            "status": 200, "payload": {}, "created_at": now - bridge.IDEMPOTENCY_TTL_S - 1,
+        }
+        bridge._idempotency_evict_locked(now)
+        self.assertNotIn("old-done", bridge._IDEMPOTENCY_KEYS)
+
+    def test_completed_entries_are_evicted_down_toward_the_cap(self):
+        now = time.monotonic()
+        for i in range(bridge.IDEMPOTENCY_MAX_ENTRIES + 5):
+            done = threading.Event()
+            done.set()
+            bridge._IDEMPOTENCY_KEYS["done-%d" % i] = {
+                "identity": ("chat-x", "hi-%d" % i, None), "event": done,
+                "status": 200, "payload": {}, "created_at": now,
+            }
+        bridge._idempotency_evict_locked(now)
+        self.assertLessEqual(len(bridge._IDEMPOTENCY_KEYS), bridge.IDEMPOTENCY_MAX_ENTRIES)
 
 
 if __name__ == "__main__":
