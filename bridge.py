@@ -735,6 +735,23 @@ def stage_outbound_attachment_from_path(path: str) -> str:
     attachment_b64 path) - the caller owns deleting the result, exactly
     like that function's.
 
+    The cap is enforced a SECOND time here, DURING the copy (Richard's
+    review, sixth pass): validate_outbound_attachment's size check above
+    reads the file's size once, before copying starts - exactly the kind
+    of single-read-trusted-forever gap this function exists to close for
+    the content hash. Richard reproduced it with an 8-byte cap: the source
+    grew from 4 to 16 bytes AFTER validation, and the 16-byte copy was
+    accepted, because nothing in the copy loop itself re-checked the
+    running total against the cap. Counting bytes as they are written and
+    stopping the instant the running total would exceed the cap - without
+    ever writing the chunk that crosses it - means the staged file this
+    function can return is never over cap, no matter what the source grows
+    to mid-copy; an overflow deletes the partial file and raises
+    AttachmentRejected, the same 400/retry_safe:true shape the original,
+    pre-copy size check already gets. Hashing (attachment_identity, in
+    do_POST) only ever sees a complete, in-cap copy - it never runs if this
+    raises.
+
     An UNKEYED attachment_path send never calls this: it is validated only
     and sent directly from the original path, unchanged ("nothing is
     copied and nothing is deleted", README).
@@ -745,11 +762,18 @@ def stage_outbound_attachment_from_path(path: str) -> str:
     name = os.path.basename(path) or "attachment"
     staged = os.path.join(OUTBOX_DIR, "%s-%s" % (uuid.uuid4().hex, name))
     fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    total = 0
     try:
         with os.fdopen(fd, "wb") as out, open(path, "rb") as src:
             for chunk in iter(lambda: src.read(1 << 20), b""):
+                total += len(chunk)
+                if total > MAX_ATTACHMENT_BYTES:
+                    raise AttachmentRejected(
+                        "attachment exceeded the %d byte cap while staging "
+                        "(grew after validation)" % MAX_ATTACHMENT_BYTES
+                    )
                 out.write(chunk)
-    except OSError:
+    except (OSError, AttachmentRejected):
         discard_staged_attachment(staged)
         raise
     return staged

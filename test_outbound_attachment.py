@@ -1476,6 +1476,47 @@ class SendRouteTest(unittest.TestCase):
         self.assertTrue(body["retry_safe"])
         self.assertEqual(self.sends, [])
 
+    def test_attachment_path_growing_past_the_cap_during_staging_is_400_retry_safe(self):
+        # Richard's review, sixth pass, reproduced with his own numbers: an
+        # 8-byte cap, a source that validates at 4 bytes (under cap) and
+        # then grows to 16 bytes (over cap) before the copy loop reads it.
+        # validate_outbound_attachment's size check runs once, before
+        # staging starts, so it cannot see this; the copy loop itself must
+        # re-check the running total against the cap as it writes, or a
+        # source that grows mid-copy gets staged, hashed, and sent anyway.
+        orig_cap = bridge.MAX_ATTACHMENT_BYTES
+        bridge.MAX_ATTACHMENT_BYTES = 8
+        small = os.path.join(self.tmp, "grows.png")
+        with open(small, "wb") as f:
+            f.write(PNG_BYTES[:4])
+
+        orig_validate = bridge.validate_outbound_attachment
+
+        def validate_then_grow(path):
+            result = orig_validate(path)
+            with open(path, "wb") as f:
+                f.write(PNG_BYTES[:4] + b"\x00" * 12)  # 16 bytes: over the 8-byte cap
+            return result
+
+        bridge.validate_outbound_attachment = validate_then_grow
+        try:
+            status, body = self._post(
+                {"chat_id": "chat-x", "text": "x", "attachment_path": small},
+                idempotency_key="k-grows-past-cap",
+            )
+        finally:
+            bridge.validate_outbound_attachment = orig_validate
+            bridge.MAX_ATTACHMENT_BYTES = orig_cap
+
+        self.assertEqual(status, 400)
+        self.assertIn("8 byte cap", body["error"])
+        self.assertTrue(body["retry_safe"])
+        self.assertEqual(self.sends, [], "a source that grew past the cap must never reach osascript")
+        self.assertEqual(
+            os.listdir(bridge.OUTBOX_DIR), [],
+            "the partial staged file must be deleted, not left behind",
+        )
+
     def test_retry_safe_pre_send_failure_is_not_cached_a_same_key_retry_then_sends(self):
         # Blocker (Richard's review): a 502 retry_safe:true (nothing sent)
         # used to be cached under the key like any other outcome, so a
