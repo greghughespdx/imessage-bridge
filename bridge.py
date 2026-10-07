@@ -27,7 +27,6 @@ import sys
 import threading
 import time
 import uuid
-from contextlib import nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -292,17 +291,23 @@ SEND_STATS = {
     # still counts osascript exits, which is not a delivery signal.
     "attachment_sent": 0,
     "attachment_failed": 0,
+    # mc-vhnq7: same idea for text-only sends - counted here only once chat.db
+    # shows a bound outgoing row (or the confirmation wait gives up). "sent"
+    # above still counts osascript exits for every send, text or attachment.
+    "text_confirmed": 0,
+    "text_failed": 0,
 }
 _SEND_STATS_LOCK = threading.Lock()
 
-# One lock per chat for attachment sends (mc-am50p review, Richard 2026-09-09).
-# The confirmation reads chat.db for the row THIS request created, and the
-# only way to know which row that is, is to read the chat's highest attachment
-# ROWID before osascript runs and accept only rows above it. Two overlapping
-# sends to the same chat (ThreadingHTTPServer runs requests in parallel) would
-# otherwise share a baseline and could both claim the same row. So the
-# baseline read, the osascript send, and the confirmation wait run under the
-# chat's lock. Text-only sends do not take it; they create no attachment row.
+# One lock per chat for every confirmed send (mc-am50p review, Richard
+# 2026-09-09; extended to text-only sends by mc-vhnq7). The confirmation reads
+# chat.db for the row THIS request created, and the only way to know which row
+# that is, is to read the chat's highest attachment ROWID, or highest outgoing
+# message ROWID for a text-only send, before osascript runs and accept only
+# rows above it. Two overlapping sends to the same chat (ThreadingHTTPServer
+# runs requests in parallel) would otherwise share a baseline and could both
+# claim the same row. So the baseline read, the osascript send, and the
+# confirmation wait run under the chat's lock, for both kinds of send.
 _CHAT_SEND_LOCKS = {}
 _CHAT_SEND_LOCKS_GUARD = threading.Lock()
 
@@ -1040,43 +1045,6 @@ def send_message(chat_id: str, text: str, attachment_path=None) -> float:
     return elapsed
 
 
-def probe_outgoing_row(db_path: str, chat_id: str, sent_after_unix_ms: int) -> None:
-    """Background probe (mc-lkbx): after a send reports success, verify an
-    is_from_me row actually landed in chat.db for that chat. AppleScript can
-    return success while Messages.app silently drops the send; this makes that
-    class visible in the log instead of invisible."""
-    def _probe():
-        time.sleep(3.0)
-        try:
-            uri = f"file:{db_path}?mode=ro"
-            conn = sqlite3.connect(uri, uri=True)
-            cur = conn.cursor()
-            cur.execute("PRAGMA query_only = ON")
-            cur.execute(
-                """
-                SELECT COUNT(*) FROM message m
-                JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
-                JOIN chat c ON cmj.chat_id = c.ROWID
-                WHERE c.guid = ? AND m.is_from_me = 1 AND m.date > ?
-                """,
-                (chat_id, unix_ms_to_apple_ns(sent_after_unix_ms)),
-            )
-            count = cur.fetchone()[0]
-            conn.close()
-            if count > 0:
-                log.info("send-probe ok chat=%s outgoing_rows=%d", chat_id, count)
-            else:
-                log.warning(
-                    "send-probe MISSING chat=%s - AppleScript succeeded but no "
-                    "outgoing row in chat.db within 3s (silent drop or slow write)",
-                    chat_id,
-                )
-        except Exception as e:
-            log.warning("send-probe error chat=%s: %s", chat_id, e)
-
-    threading.Thread(target=_probe, daemon=True).start()
-
-
 def _open_chat_db_readonly(db_path: str):
     uri = f"file:{db_path}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
@@ -1285,6 +1253,189 @@ def wait_for_attachment_transfer(
         detail="attachment still in flight after %.0fs (transfer_state %s)"
         % (timeout_s, last["transfer_state"]),
     )
+
+
+# ---------------------------------------------------------------------------
+# Text-only sends (mc-vhnq7)
+#
+# A text-only POST /send used to return 200 the moment osascript exited 0,
+# then fire a background probe (probe_outgoing_row, now removed) that only
+# ever reached the log, never the HTTP response - so a send Messages.app
+# silently dropped still came back "sent" to the caller. This follows
+# read_attachment_high_water / _query_outgoing_attachment_for_send /
+# wait_for_attachment_transfer's contract instead: read a high-water mark
+# before osascript runs, under the chat's send lock, and hold the response
+# until chat.db proves a row landed.
+# ---------------------------------------------------------------------------
+
+
+def read_message_high_water(db_path: str, chat_id: str) -> int:
+    """The highest outgoing (is_from_me) message ROWID in this chat right
+    now, or 0.
+
+    Read BEFORE osascript runs, under the chat's send lock - the same rule
+    read_attachment_high_water follows for attachments. The row this text
+    send creates will have a ROWID above this mark; every row at or below it
+    belongs to an earlier message and is never this request's evidence.
+    Raises sqlite3.Error when chat.db cannot be read.
+    """
+    conn, cur = _open_chat_db_readonly(db_path)
+    try:
+        cur.execute(
+            """
+            SELECT COALESCE(MAX(m.ROWID), 0)
+            FROM message m
+            JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+            JOIN chat c ON cmj.chat_id = c.ROWID
+            WHERE c.guid = ? AND m.is_from_me = 1
+            """,
+            (chat_id,),
+        )
+        return int(cur.fetchone()[0] or 0)
+    finally:
+        conn.close()
+
+
+def _query_outgoing_message_for_send(
+    db_path: str, chat_id: str, after_apple_ns: int, after_rowid, expected_text,
+):
+    """One read-only look at chat.db for THIS text send's outgoing message
+    row.
+
+    Candidates are is_from_me message rows in this chat, dated after the send
+    and with ROWID above after_rowid (the high-water mark read before
+    osascript, under the chat lock). Bound by, in order:
+      1. an exact match on message.text - the common case, since Messages
+         populates that column directly for a plain outgoing text;
+      2. with no exact match among the candidates (message.text can come
+         back NULL or re-encoded - see get_messages' attributedBody note),
+         the newest candidate above the mark. The per-chat lock makes a
+         same-process collision impossible; a foreign row (a manual Messages
+         send, another process) landing in this exact window is accepted as
+         a known, logged trade-off rather than left unconfirmed forever.
+    Returns None while no candidate exists yet.
+    """
+    conn, cur = _open_chat_db_readonly(db_path)
+    try:
+        cur.execute(
+            """
+            SELECT m.ROWID, m.text, m.is_sent, m.error
+            FROM message m
+            JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
+            JOIN chat c ON cmj.chat_id = c.ROWID
+            WHERE c.guid = ? AND m.is_from_me = 1 AND m.date > ?
+              AND m.ROWID > ?
+            ORDER BY m.ROWID ASC
+            """,
+            (chat_id, after_apple_ns, after_rowid if after_rowid is not None else 0),
+        )
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        return None
+
+    row = None
+    for candidate in rows:
+        if candidate[1] == expected_text:
+            row = candidate
+            break
+    if row is None:
+        row = rows[-1]
+        log.info(
+            "message row %s above mark %s in chat %s has no text matching this "
+            "send; binding to the newest candidate instead (text column NULL "
+            "or re-encoded)",
+            row[0], after_rowid, chat_id,
+        )
+    return {
+        "message_rowid": row[0],
+        "text": row[1],
+        "is_sent": row[2],
+        "error": row[3],
+    }
+
+
+def wait_for_text_message(
+    db_path: str,
+    chat_id: str,
+    sent_after_unix_ms: int,
+    expected_text: str,
+    timeout_s=None,
+    poll_s=None,
+    now=None,
+    sleep=None,
+    after_rowid=None,
+) -> dict:
+    """Block until the text send's message row appears in chat.db, or the
+    timeout passes (mc-vhnq7).
+
+    osascript exiting 0 means Messages accepted the command, nothing more -
+    mc-mnvrm found the same class of silent failure for attachments
+    (osascript exit 0, transfer_state 6 - the picture never left the Mac).
+    The ticket's false "sent" (2026-10-05, no POST /send in the bridge log
+    after 14:15:16, no outgoing chat.db row after 14:15:17) is that same gap
+    on the text path, where the only check (probe_outgoing_row) ran in the
+    background after the HTTP response had already gone out.
+
+    after_rowid is the chat's outgoing-message high-water mark read before
+    the send (read_message_high_water), taken under the chat's send lock;
+    only rows above it count - see _query_outgoing_message_for_send for how
+    the row is bound to this request.
+
+    message.error is the same column the attachment path already reads as
+    message_error (_query_outgoing_attachment_for_send); nonzero here is
+    exactly as strong a failure signal for a text row as it is there.
+    message.is_sent is deliberately NOT used to decide failure, for the
+    reason wait_for_attachment_transfer's docstring gives for attachments:
+    Greg's phone showed texts arriving while chat.db still said is_sent 0, so
+    is_sent 0 lags real delivery and does not mean "not sent".
+
+    Shares ATTACHMENT_CONFIRM_TIMEOUT_S / ATTACHMENT_CONFIRM_POLL_S with the
+    attachment path by default - same chat.db write path, same justified
+    wait budget - overridable independently via timeout_s/poll_s if that
+    default ever stops fitting one of the two sends.
+
+    Returns {"outcome": ..., "detail": ..., **row fields}. outcome is one of:
+      "sent"    a bound row appeared with message.error == 0
+      "failed"  a bound row appeared with message.error != 0
+      "missing" no bound row appeared in chat.db within timeout_s
+      "error"   chat.db could not be read
+    Only "sent" is a success.
+    """
+    timeout_s = ATTACHMENT_CONFIRM_TIMEOUT_S if timeout_s is None else timeout_s
+    poll_s = ATTACHMENT_CONFIRM_POLL_S if poll_s is None else poll_s
+    now = time.monotonic if now is None else now
+    sleep = time.sleep if sleep is None else sleep
+    after_apple_ns = unix_ms_to_apple_ns(sent_after_unix_ms)
+
+    deadline = now() + timeout_s
+    while True:
+        try:
+            row = _query_outgoing_message_for_send(
+                db_path, chat_id, after_apple_ns, after_rowid, expected_text,
+            )
+        except sqlite3.Error as e:
+            return {"outcome": "error", "detail": "chat.db read failed: %s" % e}
+        if row is not None:
+            if row["error"]:
+                return dict(
+                    row,
+                    outcome="failed",
+                    detail="Messages marked the text failed (message error %s)"
+                    % row["error"],
+                )
+            return dict(row, outcome="sent", detail="message row confirmed")
+        if now() >= deadline:
+            break
+        sleep(poll_s)
+
+    return {
+        "outcome": "missing",
+        "detail": "no outgoing chat.db row appeared for this text within %.0fs"
+        % timeout_s,
+    }
 
 
 def _messages_kept_the_staged_file(row, staged_path) -> bool:
@@ -1564,12 +1715,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.send_error_json(500, "Cannot stage attachment")
             return
 
-        # An attachment send holds the chat's lock from the high-water read,
-        # through osascript, to the end of the confirmation wait, so no other
-        # send to this chat can create an attachment row that this request
-        # might mistake for its own. Text-only sends are not serialized.
-        serialize = chat_send_lock(chat_id) if send_path is not None else nullcontext()
-        with serialize:
+        # Every confirmed send - attachment or text-only (mc-vhnq7) - holds
+        # the chat's lock from the high-water read, through osascript, to the
+        # end of the confirmation wait, so no other send to this chat can
+        # create a row that this request might mistake for its own.
+        with chat_send_lock(chat_id):
             after_rowid = None
             if send_path is not None:
                 try:
@@ -1595,6 +1745,27 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         "attachment_confirm_s": 0.0,
                     })
                     return
+            else:
+                try:
+                    after_rowid = read_message_high_water(self.db_path, chat_id)
+                except sqlite3.Error as e:
+                    # Same contract as the attachment branch above: no
+                    # baseline means this text send could never be confirmed,
+                    # so osascript never runs and the caller gets a 502.
+                    detail = "chat.db read failed before send: %s" % e
+                    with _SEND_STATS_LOCK:
+                        SEND_STATS["text_failed"] += 1
+                        SEND_STATS["last_error"] = ("text error: %s" % detail)[:300]
+                    log.error("text ERROR chat=%s (not sent): %s", chat_id, detail)
+                    self.send_json(502, {
+                        "status": "text_failed",
+                        "error": "text not confirmed: %s" % detail,
+                        "text_outcome": "error",
+                        "applescript_elapsed_s": 0.0,
+                        "text_sent": False,
+                        "attachment_sent": False,
+                    })
+                    return
 
             sent_at_ms = int(time.time() * 1000) - 2000  # 2s slack for clock/db skew
             try:
@@ -1612,27 +1783,63 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.send_error_json(500, str(e))
                 return
 
+            # osascript exit 0 is not delivery, for text (mc-vhnq7) or for an
+            # attachment (mc-mnvrm) - hold the response until chat.db proves
+            # a row landed, bound to this request by the high-water mark read
+            # above. The staged file, when there is one, must outlive this
+            # wait: Messages reads it during the transfer, not at the moment
+            # the AppleScript returns.
+            t1 = time.monotonic()
             if send_path is None:
-                probe_outgoing_row(self.db_path, chat_id, sent_at_ms)
+                result = wait_for_text_message(
+                    self.db_path, chat_id, sent_at_ms, text, after_rowid=after_rowid,
+                )
+            else:
+                result = wait_for_attachment_transfer(
+                    self.db_path, chat_id, sent_at_ms,
+                    after_rowid=after_rowid, expected_path=send_path,
+                )
+            confirm_elapsed = time.monotonic() - t1
+
+        if send_path is None:
+            if result["outcome"] == "sent":
+                with _SEND_STATS_LOCK:
+                    SEND_STATS["text_confirmed"] += 1
+                    SEND_STATS["last_send_at"] = time.time()
+                log.info(
+                    "text ok chat=%s confirm=%.1fs message_rowid=%s",
+                    chat_id, confirm_elapsed, result.get("message_rowid"),
+                )
                 self.send_json(200, {
                     "status": "sent",
                     "applescript_elapsed_s": round(elapsed, 2),
                     "attachment_sent": False,
+                    "text_confirm_s": round(confirm_elapsed, 1),
                 })
                 return
 
-            # mc-mnvrm: osascript exit 0 is not delivery. Hold the response,
-            # and the staged file, until chat.db shows the transfer finished or
-            # failed. The file must outlive this wait: Messages reads it during
-            # the transfer, not at the moment the AppleScript returns. The row
-            # is bound to this request: above the high-water mark and named
-            # for the file that was sent.
-            t1 = time.monotonic()
-            result = wait_for_attachment_transfer(
-                self.db_path, chat_id, sent_at_ms,
-                after_rowid=after_rowid, expected_path=send_path,
+            detail = result["detail"]
+            with _SEND_STATS_LOCK:
+                SEND_STATS["text_failed"] += 1
+                SEND_STATS["last_error"] = ("text %s: %s" % (result["outcome"], detail))[:300]
+            log.error(
+                "text %s chat=%s confirm=%.1fs: %s",
+                result["outcome"].upper(), chat_id, confirm_elapsed, detail,
             )
-            confirm_elapsed = time.monotonic() - t1
+            # 502: the bridge did its part (osascript exited 0), but chat.db
+            # never showed a row bound to this send - exactly the class of
+            # false "sent" the ticket reported. text_failed, not sent.
+            self.send_json(502, {
+                "status": "text_failed",
+                "error": "text not confirmed: %s" % detail,
+                "text_outcome": result["outcome"],
+                "applescript_elapsed_s": round(elapsed, 2),
+                "text_sent": False,
+                "attachment_sent": False,
+                "text_confirm_s": round(confirm_elapsed, 1),
+            })
+            return
+
         kept = _messages_kept_the_staged_file(result, staged_path)
         if result["outcome"] == "sent" and kept:
             # The transcript row on this Mac points at our file. Deleting it

@@ -411,7 +411,6 @@ class SendRouteTest(unittest.TestCase):
         # Record what would have been sent; never call osascript.
         self.sends = []
         self._orig_send = bridge.send_message
-        self._orig_probe = bridge.probe_outgoing_row
 
         def fake_send(chat_id, text, attachment_path=None):
             existed = bool(attachment_path) and os.path.isfile(attachment_path)
@@ -426,7 +425,6 @@ class SendRouteTest(unittest.TestCase):
             return 0.01
 
         bridge.send_message = fake_send
-        bridge.probe_outgoing_row = lambda *a, **k: None
 
         # mc-mnvrm: the route now waits on chat.db for the attachment's
         # transfer_state. Default it to "delivered, copied by Messages"; the
@@ -447,6 +445,29 @@ class SendRouteTest(unittest.TestCase):
 
         bridge.wait_for_attachment_transfer = fake_wait
 
+        # mc-vhnq7: text-only sends now wait on chat.db the same way. Default
+        # it to "a bound row showed up"; the failure tests swap in other
+        # outcomes. Kept separate from self.waits (the attachment wait) so a
+        # test can assert on either without the two being conflated.
+        self._orig_wait_text = bridge.wait_for_text_message
+        self.text_waits = []
+        self.text_wait_result = {
+            "outcome": "sent",
+            "detail": "message row confirmed",
+            "message_rowid": 99,
+            "text": None,  # overwritten per-call below with the real text
+            "is_sent": 0,
+            "error": 0,
+        }
+
+        def fake_wait_text(db_path, chat_id, sent_after_unix_ms, expected_text, *a, **k):
+            self.text_waits.append(
+                {"db_path": db_path, "chat_id": chat_id, "expected_text": expected_text}
+            )
+            return dict(self.text_wait_result, text=expected_text)
+
+        bridge.wait_for_text_message = fake_wait_text
+
         # The janitor runs in a thread after a kept send; record instead.
         self._orig_janitor = bridge.start_outbox_janitor
         self.janitor_runs = []
@@ -456,6 +477,8 @@ class SendRouteTest(unittest.TestCase):
             self._orig_stats = dict(bridge.SEND_STATS)
             bridge.SEND_STATS["attachment_sent"] = 0
             bridge.SEND_STATS["attachment_failed"] = 0
+            bridge.SEND_STATS["text_confirmed"] = 0
+            bridge.SEND_STATS["text_failed"] = 0
 
         handler = bridge.make_handler(self.db_path, TEST_TOKEN)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -467,8 +490,8 @@ class SendRouteTest(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         bridge.send_message = self._orig_send
-        bridge.probe_outgoing_row = self._orig_probe
         bridge.wait_for_attachment_transfer = self._orig_wait
+        bridge.wait_for_text_message = self._orig_wait_text
         bridge.start_outbox_janitor = self._orig_janitor
         bridge.OUTBOX_DIR = self._orig_outbox
         with bridge._SEND_STATS_LOCK:
@@ -499,12 +522,19 @@ class SendRouteTest(unittest.TestCase):
         conn.close()
         return resp.status, json.loads(body)
 
-    def test_text_only_send_is_unchanged(self):
+    def test_text_only_send_is_200_once_chat_db_confirms_it(self):
+        # mc-vhnq7: the AppleScript shape is unchanged (see BuildSendScriptTest)
+        # but the response now depends on wait_for_text_message, not just
+        # osascript's exit code.
         status, body = self._post({"chat_id": "chat-x", "text": "hello"})
         self.assertEqual(status, 200)
         self.assertEqual(body["status"], "sent")
         self.assertFalse(body["attachment_sent"])
         self.assertEqual(self.sends[0]["attachment_path"], None)
+        self.assertEqual(self.text_waits[0]["chat_id"], "chat-x")
+        self.assertEqual(self.text_waits[0]["expected_text"], "hello")
+        self.assertEqual(self._stats()["text_confirmed"], 1)
+        self.assertEqual(self._stats()["text_failed"], 0)
 
     def test_attachment_path_is_passed_through(self):
         status, body = self._post(
@@ -614,10 +644,69 @@ class SendRouteTest(unittest.TestCase):
 
     # ---- mc-mnvrm: the response follows chat.db, not osascript's exit ----
 
-    def test_text_only_send_never_waits_on_chat_db(self):
+    def test_text_only_send_waits_on_the_message_row_not_the_attachment_wait(self):
+        # mc-vhnq7 flipped this: a text-only send now DOES wait on chat.db
+        # (wait_for_text_message), but it still never touches the attachment
+        # confirmation path (wait_for_attachment_transfer) - there is no
+        # attachment row to wait for.
         status, _ = self._post({"chat_id": "chat-x", "text": "hello"})
         self.assertEqual(status, 200)
+        self.assertEqual(len(self.text_waits), 1)
         self.assertEqual(self.waits, [])
+
+    def test_applescript_ok_but_no_row_appears_is_502_text_failed(self):
+        # The exact ticket scenario (mc-vhnq7): osascript exits 0, but
+        # Messages.app never produces a bound chat.db row.
+        self.text_wait_result = {
+            "outcome": "missing",
+            "detail": "no outgoing chat.db row appeared for this text within 30s",
+        }
+        status, body = self._post({"chat_id": "chat-x", "text": "hello"})
+        self.assertEqual(status, 502)
+        self.assertEqual(body["status"], "text_failed")
+        self.assertEqual(body["text_outcome"], "missing")
+        self.assertFalse(body["text_sent"])
+        self.assertFalse(body["attachment_sent"])
+        self.assertIn("not confirmed", body["error"])
+        stats = self._stats()
+        self.assertEqual(stats["text_failed"], 1)
+        self.assertEqual(stats["text_confirmed"], 0)
+        self.assertIn("text missing", stats["last_error"])
+
+    def test_row_with_a_message_error_is_502_text_failed(self):
+        # message.error != 0 is as strong a failure signal for a text row as
+        # message_error already is for an attachment row.
+        self.text_wait_result = {
+            "outcome": "failed",
+            "detail": "Messages marked the text failed (message error 22)",
+            "message_rowid": 101,
+            "is_sent": 0,
+            "error": 22,
+        }
+        status, body = self._post({"chat_id": "chat-x", "text": "hello"})
+        self.assertEqual(status, 502)
+        self.assertEqual(body["status"], "text_failed")
+        self.assertEqual(body["text_outcome"], "failed")
+        self.assertIn("message error 22", body["error"])
+        self.assertEqual(self._stats()["text_failed"], 1)
+
+    def test_text_chat_db_read_error_before_send_is_502_and_nothing_is_sent(self):
+        orig = bridge.read_message_high_water
+
+        def broken(db_path, chat_id):
+            raise sqlite3.OperationalError("unable to open database file")
+
+        bridge.read_message_high_water = broken
+        try:
+            status, body = self._post({"chat_id": "chat-x", "text": "hello"})
+        finally:
+            bridge.read_message_high_water = orig
+        self.assertEqual(status, 502)
+        self.assertEqual(body["status"], "text_failed")
+        self.assertEqual(body["text_outcome"], "error")
+        self.assertEqual(self.sends, [], "osascript ran without a baseline")
+        self.assertEqual(self.text_waits, [])
+        self.assertEqual(self._stats()["text_failed"], 1)
 
     def test_confirmed_attachment_is_200_with_the_transfer_state(self):
         status, body = self._post(self._b64_payload())
@@ -1279,6 +1368,140 @@ class WaitForAttachmentTransferTest(unittest.TestCase):
         self.assertFalse(bridge._messages_kept_the_staged_file({"filename": ""}, staged))
         self.assertFalse(bridge._messages_kept_the_staged_file({"outcome": "missing"}, staged))
         self.assertFalse(bridge._messages_kept_the_staged_file({"filename": staged}, None))
+
+
+class WaitForTextMessageTest(unittest.TestCase):
+    """wait_for_text_message against a real sqlite file shaped like chat.db
+    (mc-vhnq7). Time is injected so no test sleeps."""
+
+    CHAT = "iMessage;-;self@example.invalid"
+    SENT_AFTER_MS = 1_700_000_000_000
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mc-vhnq7-")
+        self.db_path = os.path.join(self.tmp, "chat.db")
+        self.conn = sqlite3.connect(self.db_path)
+        self.conn.executescript(MINIMAL_SCHEMA)
+        self.conn.execute("INSERT INTO chat (ROWID, guid, style) VALUES (1, ?, 45)", (self.CHAT,))
+        self.conn.execute("INSERT INTO chat (ROWID, guid, style) VALUES (2, 'iMessage;-;other', 45)")
+        self.conn.commit()
+        self.clock = [0.0]
+        self.slept = []
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _now(self):
+        return self.clock[0]
+
+    def _sleep(self, s):
+        self.slept.append(s)
+        self.clock[0] += s
+
+    def _wait(self, expected_text="hello", timeout_s=2.0, after_rowid=None):
+        return bridge.wait_for_text_message(
+            self.db_path, self.CHAT, self.SENT_AFTER_MS, expected_text,
+            timeout_s=timeout_s, poll_s=0.5, now=self._now, sleep=self._sleep,
+            after_rowid=after_rowid,
+        )
+
+    def _add_row(self, chat_rowid=1, offset_ms=1000, is_from_me=1, text="hello",
+                 error=0, msg_rowid=None):
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT INTO message (ROWID, guid, text, date, is_from_me, is_sent, error) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?)",
+            (msg_rowid, "m-%s" % (msg_rowid or "x"), text,
+             _apple_ns(self.SENT_AFTER_MS + offset_ms), is_from_me, error),
+        )
+        msg_rowid = cur.lastrowid
+        cur.execute("INSERT INTO chat_message_join VALUES (?, ?)", (chat_rowid, msg_rowid))
+        self.conn.commit()
+        return msg_rowid
+
+    # ---- the ticket scenario: osascript exits 0, row never shows up ----
+
+    def test_no_row_at_all_is_missing(self):
+        result = self._wait(timeout_s=1.0)
+        self.assertEqual(result["outcome"], "missing")
+        self.assertNotIn("message_rowid", result)
+
+    def test_ignores_rows_older_than_the_send(self):
+        self._add_row(offset_ms=-5000)
+        result = self._wait(timeout_s=1.0)
+        self.assertEqual(result["outcome"], "missing")
+
+    def test_ignores_other_chats_and_inbound_messages(self):
+        self._add_row(chat_rowid=2)
+        self._add_row(is_from_me=0)
+        result = self._wait(timeout_s=1.0)
+        self.assertEqual(result["outcome"], "missing")
+
+    def test_rows_at_or_below_the_mark_never_count(self):
+        rowid = self._add_row()
+        result = self._wait(after_rowid=rowid, timeout_s=1.0)
+        self.assertEqual(result["outcome"], "missing")
+
+    # ---- a row appears: 200 ----
+
+    def test_matching_row_is_sent(self):
+        rowid = self._add_row(text="hello")
+        result = self._wait()
+        self.assertEqual(result["outcome"], "sent")
+        self.assertEqual(result["message_rowid"], rowid)
+        self.assertEqual(self.slept, [])
+
+    def test_polls_until_the_row_appears(self):
+        original_sleep = self._sleep
+        added = {}
+
+        def sleep_then_add(s):
+            original_sleep(s)
+            if len(self.slept) == 3:
+                added["rowid"] = self._add_row(text="hello")
+
+        result = bridge.wait_for_text_message(
+            self.db_path, self.CHAT, self.SENT_AFTER_MS, "hello",
+            timeout_s=10.0, poll_s=0.5, now=self._now, sleep=sleep_then_add,
+        )
+        self.assertEqual(result["outcome"], "sent")
+        self.assertEqual(result["message_rowid"], added["rowid"])
+        self.assertEqual(len(self.slept), 3)
+
+    def test_no_exact_text_match_falls_back_to_the_newest_candidate(self):
+        # message.text can come back NULL/re-encoded (get_messages' own
+        # attributedBody note). With no exact match, bind to the newest
+        # candidate above the mark rather than leave a real send unconfirmed.
+        self._add_row(text=None, offset_ms=1000)
+        newest = self._add_row(text=None, offset_ms=1500)
+        result = self._wait(expected_text="hello", timeout_s=1.0)
+        self.assertEqual(result["outcome"], "sent")
+        self.assertEqual(result["message_rowid"], newest)
+
+    # ---- a row appears with an error flag: 502 ----
+
+    def test_row_with_a_nonzero_error_is_failed(self):
+        rowid = self._add_row(text="hello", error=22)
+        result = self._wait()
+        self.assertEqual(result["outcome"], "failed")
+        self.assertEqual(result["message_rowid"], rowid)
+        self.assertIn("22", result["detail"])
+
+    def test_unreadable_db_is_error(self):
+        result = bridge.wait_for_text_message(
+            os.path.join(self.tmp, "nope.db"), self.CHAT, self.SENT_AFTER_MS, "hello",
+            timeout_s=1.0, poll_s=0.5, now=self._now, sleep=self._sleep,
+        )
+        self.assertEqual(result["outcome"], "error")
+
+    def test_high_water_mark_reads_the_chats_highest_outgoing_message(self):
+        self.assertEqual(bridge.read_message_high_water(self.db_path, self.CHAT), 0)
+        rowid = self._add_row()
+        self._add_row(chat_rowid=2)   # other chat
+        self._add_row(is_from_me=0)   # inbound
+        self.assertEqual(bridge.read_message_high_water(self.db_path, self.CHAT), rowid)
+        with self.assertRaises(sqlite3.Error):
+            bridge.read_message_high_water(os.path.join(self.tmp, "nope.db"), self.CHAT)
 
 
 if __name__ == "__main__":

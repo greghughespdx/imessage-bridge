@@ -258,9 +258,15 @@ class AuthenticatedRoutesTest(unittest.TestCase):
 
         self.sends = []
         self._orig_send = bridge.send_message
-        self._orig_probe = bridge.probe_outgoing_row
+        self._orig_wait_text = bridge.wait_for_text_message
         bridge.send_message = lambda c, t, a=None: self.sends.append(c) or 0.01
-        bridge.probe_outgoing_row = lambda *a, **k: None
+        # mc-vhnq7: /send now holds for chat.db confirmation even on this
+        # test's throwaway MINIMAL_SCHEMA db, which never gets a matching
+        # row. These auth tests are not about the confirmation contract, so
+        # stub it to the old "sent" outcome immediately.
+        bridge.wait_for_text_message = lambda *a, **k: {
+            "outcome": "sent", "detail": "stub", "message_rowid": None,
+        }
 
         handler = bridge.make_handler(self.db_path, TEST_TOKEN)
         bridge.add_info_endpoint(handler, "test-bridge", 8432)
@@ -274,7 +280,7 @@ class AuthenticatedRoutesTest(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
         bridge.send_message = self._orig_send
-        bridge.probe_outgoing_row = self._orig_probe
+        bridge.wait_for_text_message = self._orig_wait_text
         bridge._AUTH_LOG_SEEN.clear()
 
     def _request(self, method, path, token, body=None):

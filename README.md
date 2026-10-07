@@ -249,9 +249,16 @@ Content-Type: application/json
 {"chat_id": "iMessage;-;+1234567890", "text": "Hello"}
 ```
 
-Returns `{"status": "sent", "applescript_elapsed_s": 0.42, "attachment_sent": false}` on success. The `chat_id` is the iMessage chat GUID. You can find it in the `chat_guid` field of received messages.
+Returns `{"status": "sent", "applescript_elapsed_s": 0.42, "attachment_sent": false, "text_confirm_s": 0.5}` on success. The `chat_id` is the iMessage chat GUID. You can find it in the `chat_guid` field of received messages.
 
-For a text-only send, "success" means Messages.app accepted the AppleScript. chat.db's `is_sent` flag is not consulted: on 2026-09-09 it stayed 0 on texts that had already arrived on the phone.
+**A text-only send is confirmed against chat.db, not against osascript (mc-vhnq7).** osascript exiting 0 only means Messages.app accepted the AppleScript; on 2026-10-05 that happened for a text the bridge log and chat.db never show arriving. Before the AppleScript runs, the bridge reads the chat's highest outgoing message ROWID (the high-water mark), under the same per-chat lock an attachment send takes. After it returns, the bridge polls chat.db for a row above that mark whose `text` matches what was sent (falling back to the newest row above the mark if `text` comes back NULL or re-encoded - see the `/messages` note on `attributedBody` above) and holds the response until that row appears, up to `IMESSAGE_BRIDGE_ATTACHMENT_TIMEOUT_S` (default 30s, the same budget and env var the attachment path uses - both wait on the same chat.db write path). `message.is_sent` is not consulted as a failure signal: on 2026-09-09 it stayed 0 on texts that had already arrived on the phone. A row with a nonzero `message.error` is treated as a failure, the same way the attachment path already reads `message.error` for its own confirmation.
+
+| Result | HTTP | Body |
+|--------|------|------|
+| A bound row appears with `error` 0 | 200 | `{"status": "sent", "attachment_sent": false, "text_confirm_s": 0.5, ...}` |
+| No bound row appears within the timeout, a bound row has a nonzero `error`, or chat.db is unreadable before the send | 502 | `{"status": "text_failed", "error": "text not confirmed: ...", "text_outcome": "missing" \| "failed" \| "error", "text_sent": false, "attachment_sent": false, ...}` |
+
+`/healthz` counts both outcomes in `send_stats.text_confirmed` and `send_stats.text_failed`.
 
 **Send a message with an image:**
 
@@ -325,7 +332,7 @@ The installer also reads `IMESSAGE_BRIDGE_PORT` and `IMESSAGE_BRIDGE_NAME` envir
 | `IMESSAGE_BRIDGE_LOG` | /usr/local/var/log/imessage-bridge-app.log | Rotating application log |
 | `IMESSAGE_BRIDGE_TOKEN_FILE` | ~/.config/imessage-bridge/token | Shared secret for the `X-Bridge-Token` header. Must be `0600`. Read by the bridge AND by every client. |
 | `IMESSAGE_BRIDGE_OUTBOX_DIR` | ~/Library/Messages/Attachments/imessage-bridge-outbox | Where `attachment_b64` uploads are staged before sending. Files are `0600` and deleted once chat.db confirms the transfer. Messages.app is sandboxed and can only read paths its entitlements grant (`~/Library/Messages/`, `~/Media/`, `~/Downloads`, a few caches); the old default `~/.imessage-bridge/outbox` was outside that grant and every picture sent from it failed with `transfer_state` 6 (mc-am50p, 2026-09-09). Keep any override inside the grant. The directory is checked on every staged send, not only when it is created: it must be a directory owned by the bridge's own user (anything else is refused with an error), and any group or world bits are chmod'ed away to `0700` first, with a warning in the log naming the old mode. |
-| `IMESSAGE_BRIDGE_ATTACHMENT_TIMEOUT_S` | 30 | How long `POST /send` waits for the attachment row in chat.db to reach a final `transfer_state` before answering 502. |
+| `IMESSAGE_BRIDGE_ATTACHMENT_TIMEOUT_S` | 30 | How long `POST /send` waits for chat.db to confirm a send before answering 502: an attachment row reaching a final `transfer_state`, or (mc-vhnq7) a text-only send's message row appearing. Shared by both paths - same chat.db write path, same justified wait budget. |
 | `IMESSAGE_BRIDGE_OUTBOX_RETENTION_DAYS` | 30 | Age after which the outbox janitor deletes bridge-staged files that Messages kept referencing (see "staged_file_kept"). |
 | `IMESSAGE_ATTACHMENTS_DIR` | ~/Library/Messages/Attachments | Base directory inbound attachments must live under |
 
