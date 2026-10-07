@@ -23,6 +23,7 @@ import unittest
 from http.server import ThreadingHTTPServer
 
 import bridge
+from test_attributed_body import make_blob as make_attributed_body_blob
 
 
 # Smallest thing that is unambiguously a PNG by signature and extension. The
@@ -479,6 +480,7 @@ class SendRouteTest(unittest.TestCase):
             bridge.SEND_STATS["attachment_failed"] = 0
             bridge.SEND_STATS["text_confirmed"] = 0
             bridge.SEND_STATS["text_failed"] = 0
+            bridge.SEND_STATS["text_unconfirmed"] = 0
 
         handler = bridge.make_handler(self.db_path, TEST_TOKEN)
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -654,28 +656,48 @@ class SendRouteTest(unittest.TestCase):
         self.assertEqual(len(self.text_waits), 1)
         self.assertEqual(self.waits, [])
 
-    def test_applescript_ok_but_no_row_appears_is_502_text_failed(self):
+    def test_applescript_ok_but_no_row_appears_is_504_text_unconfirmed(self):
         # The exact ticket scenario (mc-vhnq7): osascript exits 0, but
-        # Messages.app never produces a bound chat.db row.
+        # Messages.app never produces a matching chat.db row by the deadline.
+        # This is AMBIGUOUS, not a definite failure - Richard's review: the
+        # message may still be mid-send, so this must be distinguishable
+        # from text_failed and never retried by a caller.
         self.text_wait_result = {
-            "outcome": "missing",
-            "detail": "no outgoing chat.db row appeared for this text within 30s",
+            "outcome": "unconfirmed",
+            "detail": "no outgoing chat.db row exactly matching this text appeared within 30s",
         }
         status, body = self._post({"chat_id": "chat-x", "text": "hello"})
-        self.assertEqual(status, 502)
-        self.assertEqual(body["status"], "text_failed")
-        self.assertEqual(body["text_outcome"], "missing")
+        self.assertEqual(status, 504)
+        self.assertEqual(body["status"], "text_unconfirmed")
+        self.assertEqual(body["text_outcome"], "unconfirmed")
+        self.assertFalse(body["retry_safe"])
         self.assertFalse(body["text_sent"])
         self.assertFalse(body["attachment_sent"])
         self.assertIn("not confirmed", body["error"])
         stats = self._stats()
-        self.assertEqual(stats["text_failed"], 1)
+        self.assertEqual(stats["text_unconfirmed"], 1)
+        self.assertEqual(stats["text_failed"], 0)
         self.assertEqual(stats["text_confirmed"], 0)
-        self.assertIn("text missing", stats["last_error"])
+        self.assertIn("text unconfirmed", stats["last_error"])
+
+    def test_chat_db_unreadable_during_the_poll_is_also_504_text_unconfirmed(self):
+        # "error" (chat.db unreadable while polling, after osascript already
+        # ran) is just as ambiguous as "unconfirmed" - the bridge cannot
+        # prove the send failed, so it must not be reported as a definite
+        # text_failed either.
+        self.text_wait_result = {"outcome": "error", "detail": "chat.db read failed: locked"}
+        status, body = self._post({"chat_id": "chat-x", "text": "hello"})
+        self.assertEqual(status, 504)
+        self.assertEqual(body["status"], "text_unconfirmed")
+        self.assertEqual(body["text_outcome"], "error")
+        self.assertFalse(body["retry_safe"])
+        self.assertEqual(self._stats()["text_unconfirmed"], 1)
 
     def test_row_with_a_message_error_is_502_text_failed(self):
-        # message.error != 0 is as strong a failure signal for a text row as
-        # message_error already is for an attachment row.
+        # message.error != 0 on a MATCHED row is as strong a failure signal
+        # for a text row as message_error already is for an attachment row.
+        # This IS a definite failure (unlike "unconfirmed" above): safe to
+        # retry, so it keeps the 502/text_failed/retry_safe:true shape.
         self.text_wait_result = {
             "outcome": "failed",
             "detail": "Messages marked the text failed (message error 22)",
@@ -687,10 +709,15 @@ class SendRouteTest(unittest.TestCase):
         self.assertEqual(status, 502)
         self.assertEqual(body["status"], "text_failed")
         self.assertEqual(body["text_outcome"], "failed")
+        self.assertTrue(body["retry_safe"])
         self.assertIn("message error 22", body["error"])
         self.assertEqual(self._stats()["text_failed"], 1)
+        self.assertEqual(self._stats()["text_unconfirmed"], 0)
 
     def test_text_chat_db_read_error_before_send_is_502_and_nothing_is_sent(self):
+        # Unlike the post-send "error" outcome above, THIS error happens
+        # before osascript ever runs - nothing was sent, so it is a definite,
+        # safe-to-retry failure (502/text_failed), not an ambiguous one.
         orig = bridge.read_message_high_water
 
         def broken(db_path, chat_id):
@@ -704,6 +731,7 @@ class SendRouteTest(unittest.TestCase):
         self.assertEqual(status, 502)
         self.assertEqual(body["status"], "text_failed")
         self.assertEqual(body["text_outcome"], "error")
+        self.assertTrue(body["retry_safe"])
         self.assertEqual(self.sends, [], "osascript ran without a baseline")
         self.assertEqual(self.text_waits, [])
         self.assertEqual(self._stats()["text_failed"], 1)
@@ -1406,12 +1434,12 @@ class WaitForTextMessageTest(unittest.TestCase):
         )
 
     def _add_row(self, chat_rowid=1, offset_ms=1000, is_from_me=1, text="hello",
-                 error=0, msg_rowid=None):
+                 error=0, msg_rowid=None, attributed_body=None):
         cur = self.conn.cursor()
         cur.execute(
-            "INSERT INTO message (ROWID, guid, text, date, is_from_me, is_sent, error) "
-            "VALUES (?, ?, ?, ?, ?, 0, ?)",
-            (msg_rowid, "m-%s" % (msg_rowid or "x"), text,
+            "INSERT INTO message (ROWID, guid, text, attributedBody, date, "
+            "is_from_me, is_sent, error) VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+            (msg_rowid, "m-%s" % (msg_rowid or "x"), text, attributed_body,
              _apple_ns(self.SENT_AFTER_MS + offset_ms), is_from_me, error),
         )
         msg_rowid = cur.lastrowid
@@ -1421,26 +1449,26 @@ class WaitForTextMessageTest(unittest.TestCase):
 
     # ---- the ticket scenario: osascript exits 0, row never shows up ----
 
-    def test_no_row_at_all_is_missing(self):
+    def test_no_row_at_all_is_unconfirmed(self):
         result = self._wait(timeout_s=1.0)
-        self.assertEqual(result["outcome"], "missing")
+        self.assertEqual(result["outcome"], "unconfirmed")
         self.assertNotIn("message_rowid", result)
 
     def test_ignores_rows_older_than_the_send(self):
         self._add_row(offset_ms=-5000)
         result = self._wait(timeout_s=1.0)
-        self.assertEqual(result["outcome"], "missing")
+        self.assertEqual(result["outcome"], "unconfirmed")
 
     def test_ignores_other_chats_and_inbound_messages(self):
         self._add_row(chat_rowid=2)
         self._add_row(is_from_me=0)
         result = self._wait(timeout_s=1.0)
-        self.assertEqual(result["outcome"], "missing")
+        self.assertEqual(result["outcome"], "unconfirmed")
 
     def test_rows_at_or_below_the_mark_never_count(self):
         rowid = self._add_row()
         result = self._wait(after_rowid=rowid, timeout_s=1.0)
-        self.assertEqual(result["outcome"], "missing")
+        self.assertEqual(result["outcome"], "unconfirmed")
 
     # ---- a row appears: 200 ----
 
@@ -1468,15 +1496,55 @@ class WaitForTextMessageTest(unittest.TestCase):
         self.assertEqual(result["message_rowid"], added["rowid"])
         self.assertEqual(len(self.slept), 3)
 
-    def test_no_exact_text_match_falls_back_to_the_newest_candidate(self):
-        # message.text can come back NULL/re-encoded (get_messages' own
-        # attributedBody note). With no exact match, bind to the newest
-        # candidate above the mark rather than leave a real send unconfirmed.
-        self._add_row(text=None, offset_ms=1000)
-        newest = self._add_row(text=None, offset_ms=1500)
+    # ---- Richard's review (mc-vhnq7): exact match only, never "newest" ----
+
+    def test_a_row_with_different_text_is_ignored_not_claimed(self):
+        # The earlier (rejected) design bound to "the newest candidate" when
+        # nothing matched. A manual Messages send, or another process writing
+        # to the same chat during the wait, lands exactly this shape: a real
+        # row above the mark whose text is NOT ours. It must never be
+        # confirmed by - this request keeps waiting and times out unconfirmed.
+        self._add_row(text="a manual send from the Mac itself", offset_ms=1000)
         result = self._wait(expected_text="hello", timeout_s=1.0)
+        self.assertEqual(result["outcome"], "unconfirmed")
+
+    def test_a_foreign_rows_error_is_never_reported_as_this_sends_failure(self):
+        # Same scenario, but the foreign row has a nonzero error. The old
+        # fallback would have reported THIS request as "failed" using
+        # someone else's error - exactly the false-outcome risk the review
+        # flagged. It must still come back unconfirmed, not failed.
+        self._add_row(text="unrelated", offset_ms=1000, error=99)
+        result = self._wait(expected_text="hello", timeout_s=1.0)
+        self.assertEqual(result["outcome"], "unconfirmed")
+
+    def test_decodes_attributedbody_when_text_is_null(self):
+        # message.text can legitimately be NULL with the body only in
+        # attributedBody (get_messages' own note). An exact match against the
+        # DECODED body still confirms the send - this is not the rejected
+        # "newest candidate" fallback, it is the bridge's existing inbound
+        # decoder applied to an outbound row.
+        blob = make_attributed_body_blob(b"hello")
+        rowid = self._add_row(text=None, attributed_body=blob)
+        result = self._wait(expected_text="hello")
         self.assertEqual(result["outcome"], "sent")
-        self.assertEqual(result["message_rowid"], newest)
+        self.assertEqual(result["message_rowid"], rowid)
+
+    def test_undecodable_attributedbody_is_ignored_not_claimed(self):
+        # A blob the decoder cannot read (empty, bad header, whatever) must
+        # not match anything - it is logged and treated as not matching,
+        # same as a plain text mismatch, never a crash and never a claim.
+        rowid = self._add_row(text=None, attributed_body=b"not a typedstream blob")
+        result = self._wait(expected_text="hello", timeout_s=1.0)
+        self.assertEqual(result["outcome"], "unconfirmed")
+        # The real row shows up once it actually matches.
+        self._set_text(rowid, "hello")
+        result = self._wait(timeout_s=1.0)
+        self.assertEqual(result["outcome"], "sent")
+        self.assertEqual(result["message_rowid"], rowid)
+
+    def _set_text(self, rowid, text):
+        self.conn.execute("UPDATE message SET text = ? WHERE ROWID = ?", (text, rowid))
+        self.conn.commit()
 
     # ---- a row appears with an error flag: 502 ----
 

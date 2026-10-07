@@ -292,10 +292,15 @@ SEND_STATS = {
     "attachment_sent": 0,
     "attachment_failed": 0,
     # mc-vhnq7: same idea for text-only sends - counted here only once chat.db
-    # shows a bound outgoing row (or the confirmation wait gives up). "sent"
-    # above still counts osascript exits for every send, text or attachment.
+    # shows a bound outgoing row. "sent" above still counts osascript exits
+    # for every send, text or attachment. text_failed is a DEFINITE failure
+    # (a matched row with a nonzero message.error - nothing delivered, safe
+    # to retry); text_unconfirmed is AMBIGUOUS (no exactly-matching row by
+    # the deadline, or chat.db unreadable while polling - osascript exited 0
+    # and Messages may still be mid-send, never safe to retry).
     "text_confirmed": 0,
     "text_failed": 0,
+    "text_unconfirmed": 0,
 }
 _SEND_STATS_LOCK = threading.Lock()
 
@@ -1298,28 +1303,40 @@ def read_message_high_water(db_path: str, chat_id: str) -> int:
 
 def _query_outgoing_message_for_send(
     db_path: str, chat_id: str, after_apple_ns: int, after_rowid, expected_text,
+    observed_unmatched=None,
 ):
     """One read-only look at chat.db for THIS text send's outgoing message
     row.
 
     Candidates are is_from_me message rows in this chat, dated after the send
     and with ROWID above after_rowid (the high-water mark read before
-    osascript, under the chat lock). Bound by, in order:
-      1. an exact match on message.text - the common case, since Messages
-         populates that column directly for a plain outgoing text;
-      2. with no exact match among the candidates (message.text can come
-         back NULL or re-encoded - see get_messages' attributedBody note),
-         the newest candidate above the mark. The per-chat lock makes a
-         same-process collision impossible; a foreign row (a manual Messages
-         send, another process) landing in this exact window is accepted as
-         a known, logged trade-off rather than left unconfirmed forever.
-    Returns None while no candidate exists yet.
+    osascript, under the chat lock). A candidate confirms this send ONLY on
+    an exact match against expected_text: message.text directly, or - when
+    message.text is NULL (the same attributedBody case get_messages already
+    decodes for inbound reads) - the bridge's own message_body/
+    decode_attributed_body result. A candidate that does not match is never
+    bound to this request: it is logged once (observed_unmatched, a set the
+    caller keeps across polls) and otherwise ignored.
+
+    Richard's review (mc-vhnq7): an earlier version of this function bound to
+    "the newest candidate" whenever nothing matched, on the theory that a
+    same-process collision is impossible under the chat lock. That reasoning
+    missed the real risk - a MANUAL Messages send, or another process writing
+    to the same chat, during the confirm wait - which would let a foreign
+    row's success or failure stand in for a send this request's own osascript
+    may have dropped, turning a genuine failure into a false "sent" (the
+    exact class of bug mc-vhnq7 exists to fix). Requiring an exact match means
+    such a foreign row is simply never confirmed by; this request keeps
+    waiting and, if nothing of its own appears, times out as "unconfirmed"
+    rather than claiming someone else's outcome.
+
+    Returns None while no candidate has matched yet.
     """
     conn, cur = _open_chat_db_readonly(db_path)
     try:
         cur.execute(
             """
-            SELECT m.ROWID, m.text, m.is_sent, m.error
+            SELECT m.ROWID, m.text, m.attributedBody, m.is_sent, m.error
             FROM message m
             JOIN chat_message_join cmj ON cmj.message_id = m.ROWID
             JOIN chat c ON cmj.chat_id = c.ROWID
@@ -1333,28 +1350,31 @@ def _query_outgoing_message_for_send(
     finally:
         conn.close()
 
-    if not rows:
-        return None
+    for rowid, text, attributed_body, is_sent, error in rows:
+        def _log_decode_failure(err, _rowid=rowid):
+            log.info(
+                "message row %s above mark %s in chat %s: attributedBody "
+                "could not be decoded while confirming a text send (%s); "
+                "treated as not matching",
+                _rowid, after_rowid, chat_id, err,
+            )
 
-    row = None
-    for candidate in rows:
-        if candidate[1] == expected_text:
-            row = candidate
-            break
-    if row is None:
-        row = rows[-1]
-        log.info(
-            "message row %s above mark %s in chat %s has no text matching this "
-            "send; binding to the newest candidate instead (text column NULL "
-            "or re-encoded)",
-            row[0], after_rowid, chat_id,
-        )
-    return {
-        "message_rowid": row[0],
-        "text": row[1],
-        "is_sent": row[2],
-        "error": row[3],
-    }
+        actual_text = message_body(text, attributed_body, on_error=_log_decode_failure)
+        if actual_text == expected_text:
+            return {
+                "message_rowid": rowid,
+                "text": actual_text,
+                "is_sent": is_sent,
+                "error": error,
+            }
+        if observed_unmatched is not None and rowid not in observed_unmatched:
+            observed_unmatched.add(rowid)
+            log.info(
+                "message row %s above mark %s in chat %s does not match this "
+                "send's text; not confirmed by it, ignored",
+                rowid, after_rowid, chat_id,
+            )
+    return None
 
 
 def wait_for_text_message(
@@ -1382,11 +1402,12 @@ def wait_for_text_message(
     after_rowid is the chat's outgoing-message high-water mark read before
     the send (read_message_high_water), taken under the chat's send lock;
     only rows above it count - see _query_outgoing_message_for_send for how
-    the row is bound to this request.
+    the row is bound to this request (an exact text/attributedBody match
+    only - Richard's review, mc-vhnq7).
 
     message.error is the same column the attachment path already reads as
-    message_error (_query_outgoing_attachment_for_send); nonzero here is
-    exactly as strong a failure signal for a text row as it is there.
+    message_error (_query_outgoing_attachment_for_send); nonzero on a MATCHED
+    row is exactly as strong a failure signal for a text row as it is there.
     message.is_sent is deliberately NOT used to decide failure, for the
     reason wait_for_attachment_transfer's docstring gives for attachments:
     Greg's phone showed texts arriving while chat.db still said is_sent 0, so
@@ -1398,11 +1419,20 @@ def wait_for_text_message(
     default ever stops fitting one of the two sends.
 
     Returns {"outcome": ..., "detail": ..., **row fields}. outcome is one of:
-      "sent"    a bound row appeared with message.error == 0
-      "failed"  a bound row appeared with message.error != 0
-      "missing" no bound row appeared in chat.db within timeout_s
-      "error"   chat.db could not be read
-    Only "sent" is a success.
+      "sent"         a matched row appeared with message.error == 0
+      "failed"       a matched row appeared with message.error != 0 - a
+                     DEFINITE failure: nothing was delivered, safe to retry
+      "unconfirmed"  no row exactly matching this text appeared in chat.db
+                     within timeout_s - AMBIGUOUS: osascript exited 0, so
+                     Messages may still be mid-send or the row may simply be
+                     slow to land; the caller must NOT retry (mc-vhnq7
+                     review, Richard - the same non-idempotent-send risk a
+                     client-side timeout already carries)
+      "error"        chat.db could not be read while polling - also
+                     ambiguous for the same reason, never retry
+    Only "sent" is a success. "unconfirmed" and "error" are deliberately not
+    called "missing": the bridge is not claiming nothing landed, only that it
+    could not prove anything did.
     """
     timeout_s = ATTACHMENT_CONFIRM_TIMEOUT_S if timeout_s is None else timeout_s
     poll_s = ATTACHMENT_CONFIRM_POLL_S if poll_s is None else poll_s
@@ -1411,10 +1441,12 @@ def wait_for_text_message(
     after_apple_ns = unix_ms_to_apple_ns(sent_after_unix_ms)
 
     deadline = now() + timeout_s
+    observed_unmatched = set()
     while True:
         try:
             row = _query_outgoing_message_for_send(
                 db_path, chat_id, after_apple_ns, after_rowid, expected_text,
+                observed_unmatched=observed_unmatched,
             )
         except sqlite3.Error as e:
             return {"outcome": "error", "detail": "chat.db read failed: %s" % e}
@@ -1432,9 +1464,9 @@ def wait_for_text_message(
         sleep(poll_s)
 
     return {
-        "outcome": "missing",
-        "detail": "no outgoing chat.db row appeared for this text within %.0fs"
-        % timeout_s,
+        "outcome": "unconfirmed",
+        "detail": "no outgoing chat.db row exactly matching this text appeared "
+        "within %.0fs" % timeout_s,
     }
 
 
@@ -1764,6 +1796,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         "applescript_elapsed_s": 0.0,
                         "text_sent": False,
                         "attachment_sent": False,
+                        # Definite failure: osascript never ran, nothing was
+                        # sent, so a retry carries no duplicate-send risk.
+                        "retry_safe": True,
                     })
                     return
 
@@ -1819,24 +1854,50 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return
 
             detail = result["detail"]
-            with _SEND_STATS_LOCK:
-                SEND_STATS["text_failed"] += 1
-                SEND_STATS["last_error"] = ("text %s: %s" % (result["outcome"], detail))[:300]
             log.error(
                 "text %s chat=%s confirm=%.1fs: %s",
                 result["outcome"].upper(), chat_id, confirm_elapsed, detail,
             )
-            # 502: the bridge did its part (osascript exited 0), but chat.db
-            # never showed a row bound to this send - exactly the class of
-            # false "sent" the ticket reported. text_failed, not sent.
-            self.send_json(502, {
-                "status": "text_failed",
+
+            if result["outcome"] == "failed":
+                # DEFINITE failure: a row exactly matching this text appeared
+                # with a nonzero message.error - Messages tried and nothing
+                # was delivered. Safe to retry (mc-vhnq7 review, Richard).
+                with _SEND_STATS_LOCK:
+                    SEND_STATS["text_failed"] += 1
+                    SEND_STATS["last_error"] = ("text failed: %s" % detail)[:300]
+                self.send_json(502, {
+                    "status": "text_failed",
+                    "error": "text not confirmed: %s" % detail,
+                    "text_outcome": "failed",
+                    "applescript_elapsed_s": round(elapsed, 2),
+                    "text_sent": False,
+                    "attachment_sent": False,
+                    "text_confirm_s": round(confirm_elapsed, 1),
+                    "retry_safe": True,
+                })
+                return
+
+            # AMBIGUOUS ("unconfirmed" or "error"): osascript exited 0 and
+            # the bridge could not prove anything landed - not that it
+            # proved nothing did. Messages may still be mid-send, so a
+            # retry carries the same duplicate-visible-iMessage risk as
+            # retrying after a client-side timeout (mc-vhnq7 review,
+            # Richard). 504, not 502: a distinct status the caller can key
+            # on without parsing the body, plus "retry_safe": false for
+            # anything that does read the body.
+            with _SEND_STATS_LOCK:
+                SEND_STATS["text_unconfirmed"] += 1
+                SEND_STATS["last_error"] = ("text %s: %s" % (result["outcome"], detail))[:300]
+            self.send_json(504, {
+                "status": "text_unconfirmed",
                 "error": "text not confirmed: %s" % detail,
                 "text_outcome": result["outcome"],
                 "applescript_elapsed_s": round(elapsed, 2),
                 "text_sent": False,
                 "attachment_sent": False,
                 "text_confirm_s": round(confirm_elapsed, 1),
+                "retry_safe": False,
             })
             return
 
