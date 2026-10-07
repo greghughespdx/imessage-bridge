@@ -1274,6 +1274,66 @@ class SendRouteTest(unittest.TestCase):
         self.assertEqual(status2, 409)
         self.assertEqual(len(self.sends), 1)
 
+    def test_same_path_with_changed_bytes_under_the_same_key_is_409_not_a_replay(self):
+        # Richard's review: attachment_path identity used to be the path
+        # STRING only, so overwriting the file between two requests that
+        # reuse the same key and path still compared equal, and the second
+        # request replayed the first one's (now-stale) outcome. Identity is
+        # now the file's content hash, so changed bytes under the same path
+        # and key must come back a conflict, never a replay and never a
+        # second osascript call for the new content either.
+        status1, _ = self._post(
+            {"chat_id": "chat-x", "text": "x", "attachment_path": self.png},
+            idempotency_key="k-path-bytes-changed",
+        )
+        self.assertEqual(status1, 200)
+        with open(self.png, "wb") as f:
+            f.write(PNG_BYTES + b"\x00\x00\x00\x00")  # same path, different content
+        status2, body2 = self._post(
+            {"chat_id": "chat-x", "text": "x", "attachment_path": self.png},
+            idempotency_key="k-path-bytes-changed",
+        )
+        self.assertEqual(status2, 409)
+        self.assertEqual(body2["status"], "idempotency_conflict")
+        self.assertEqual(len(self.sends), 1, "the changed-content request must never reach osascript")
+
+    def test_retry_safe_pre_send_failure_is_not_cached_a_same_key_retry_then_sends(self):
+        # Blocker (Richard's review): a 502 retry_safe:true (nothing sent)
+        # used to be cached under the key like any other outcome, so a
+        # same-key retry just replayed the SAME 502 forever instead of
+        # actually trying again. The first attempt here fails before
+        # osascript runs (chat.db unreadable for the high-water read); the
+        # retry, with the SAME key, must become a fresh owner and actually
+        # send.
+        orig = bridge.read_message_high_water
+        calls = {"n": 0}
+
+        def flaky(db_path, chat_id):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return orig(db_path, chat_id)
+
+        bridge.read_message_high_water = flaky
+        try:
+            status1, body1 = self._post(
+                {"chat_id": "chat-x", "text": "hello"}, idempotency_key="k-retry-safe-not-cached",
+            )
+            self.assertEqual(status1, 502)
+            self.assertEqual(body1["status"], "text_failed")
+            self.assertTrue(body1["retry_safe"])
+            self.assertEqual(self.sends, [], "the failed first attempt must never reach osascript")
+
+            status2, body2 = self._post(
+                {"chat_id": "chat-x", "text": "hello"}, idempotency_key="k-retry-safe-not-cached",
+            )
+            self.assertEqual(status2, 200)
+            self.assertEqual(body2["status"], "sent")
+        finally:
+            bridge.read_message_high_water = orig
+
+        self.assertEqual(len(self.sends), 1, "osascript must run exactly once - on the successful retry")
+
     def test_concurrent_requests_with_the_same_key_share_one_outcome(self):
         # "A repeat key whose first request is still in flight waits for
         # that outcome... and returns it." Exercised through a REAL second
@@ -1953,18 +2013,57 @@ class IdempotencyTest(unittest.TestCase):
     def test_finish_then_begin_returns_wait_with_the_outcome_available_immediately(self):
         role, entry = bridge.idempotency_begin("k6", ("chat-x", "hi", None))
         self.assertEqual(role, "owner")
-        bridge.idempotency_finish(entry, 200, {"status": "sent"})
+        bridge.idempotency_finish("k6", entry, 200, {"status": "sent"})
         role2, entry2 = bridge.idempotency_begin("k6", ("chat-x", "hi", None))
         self.assertEqual(role2, "wait")
         self.assertEqual(bridge.idempotency_await(entry2, timeout=1), (200, {"status": "sent"}))
 
     def test_a_504_outcome_is_stored_and_replayed_exactly(self):
         # "The stored outcome keeps the exact status and body, including a
-        # 504 marked ambiguous."
+        # 504 marked ambiguous." retry_safe: false here, so unlike the
+        # retry_safe-true tests below, the entry stays cached.
         role, entry = bridge.idempotency_begin("k7", ("chat-x", "hi", None))
         payload = {"status": "text_unconfirmed", "retry_safe": False, "text_outcome": "unconfirmed"}
-        bridge.idempotency_finish(entry, 504, payload)
+        bridge.idempotency_finish("k7", entry, 504, payload)
         self.assertEqual(bridge.idempotency_await(entry, timeout=1), (504, payload))
+        role2, entry2 = bridge.idempotency_begin("k7", ("chat-x", "hi", None))
+        self.assertEqual(role2, "wait", "a non-retry_safe outcome is still cached for replay")
+        self.assertIs(entry2, entry)
+
+    def test_a_retry_safe_outcome_releases_waiters_but_is_not_cached(self):
+        # Richard's review: retry_safe means nothing was sent for THIS
+        # attempt. Caching it as the key's permanent answer would make
+        # every later retry with the same key replay the SAME failure
+        # forever instead of ever actually trying the send - exactly
+        # backwards from what retry_safe promises. A fresh idempotency_begin
+        # with the SAME key, after a retry_safe finish, must come back
+        # "owner" again (a NEW entry), not "wait" on the old one.
+        role, entry = bridge.idempotency_begin("k9", ("chat-x", "hi", None))
+        self.assertEqual(role, "owner")
+        payload = {"status": "text_failed", "error": "...", "retry_safe": True}
+        bridge.idempotency_finish("k9", entry, 502, payload)
+
+        role2, entry2 = bridge.idempotency_begin("k9", ("chat-x", "hi", None))
+        self.assertEqual(role2, "owner", "a retry_safe outcome must not be replayed to the next request")
+        self.assertIsNot(entry2, entry, "the retry became a fresh entry, not the dropped one")
+
+    def test_a_retry_safe_finish_still_releases_an_already_blocked_waiter(self):
+        # The drop must happen AFTER releasing anyone already waiting -
+        # Richard's review: "Waiters already blocked on that key should get
+        # that same retry_safe response."
+        role, entry = bridge.idempotency_begin("k10", ("chat-x", "hi", None))
+        self.assertEqual(role, "owner")
+        role2, entry2 = bridge.idempotency_begin("k10", ("chat-x", "hi", None))
+        self.assertEqual(role2, "wait")
+        self.assertIs(entry2, entry)
+
+        payload = {"status": "text_failed", "error": "...", "retry_safe": True}
+        bridge.idempotency_finish("k10", entry, 502, payload)
+
+        # The waiter's own reference still resolves correctly even though
+        # the key has already been dropped from the map by this point.
+        self.assertEqual(bridge.idempotency_await(entry2, timeout=1), (502, payload))
+        self.assertNotIn("k10", bridge._IDEMPOTENCY_KEYS)
 
     def test_await_returns_none_on_timeout_when_never_finished(self):
         # A waiter must never start its own send just because ITS wait gave

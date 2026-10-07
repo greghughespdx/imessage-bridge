@@ -374,20 +374,62 @@ _IDEMPOTENCY_LOCK = threading.Lock()
 _IDEMPOTENCY_KEYS = {}
 
 
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def attachment_identity(attachment_path, attachment_b64, attachment_name):
     """A value equal for two requests only if they name the same attachment
     (mc-vhnq7 review: the idempotency key binds to chat, exact text, AND
     attachment identity - not just chat and text).
 
-    attachment_path is compared by its exact given value (not resolved -
-    validate_outbound_attachment's own checks run on it regardless). An
-    attachment_b64 upload is identified by its bytes and name, not by
-    decoding and re-encoding: a sha256 of the base64 TEXT the caller sent is
-    already a content fingerprint, since equal base64 text decodes to equal
-    bytes. None (no attachment) is itself a valid, comparable identity.
+    attachment_path is fingerprinted by its CONTENT (sha256, read once here),
+    not the path string. Richard's review found the earlier path-string
+    version: he overwrote a temp image between two requests reusing the same
+    key, and the identities still compared equal, so the second request
+    replayed the first request's (now-stale) outcome for content that was no
+    longer there. Reading the file's current bytes closes exactly that gap -
+    two requests naming the same path with different content now get
+    different identities, so the second one is a conflict, not a replay.
+
+    This is NOT a full fix for every TOCTOU window: this bridge never
+    stages or copies an attachment_path file (README: "Nothing is copied and
+    nothing is deleted"), so nothing stops the file changing again between
+    this read and the osascript call that actually sends it moments later
+    under the chat lock. That remaining gap is narrow (no staging, network
+    call, or wait sits between the two for the request that OWNS the key -
+    only a request that must WAIT on another one skips reading the file at
+    all) and is an accepted, documented limitation of a host-local path,
+    the same way an identical manually-sent text is (see README). Closing it
+    completely would mean copying every attachment_path file into the
+    bridge's own staging area before hashing it, changing the "nothing is
+    copied" contract for ALL attachment_path sends, keyed or not - a bigger
+    change than this finding asked for.
+
+    An attachment_b64 upload has no such gap: it is identified by its bytes
+    and name, not by decoding and re-encoding - a sha256 of the base64 TEXT
+    the caller sent is already a content fingerprint, since equal base64
+    text decodes to equal bytes, and those bytes are what stage_outbound_
+    attachment later writes and send_message sends - the hashed bytes and
+    the sent bytes are provably the same because they both come from this
+    same request body.
+
+    A path that cannot be read at all (missing, permission denied, a
+    directory) gets its own distinct, deterministic identity built from the
+    error rather than raising here - do_POST's normal staging/validation
+    step rejects it properly moments later, with its own 400 response.
+
+    None (no attachment) is itself a valid, comparable identity.
     """
     if attachment_path is not None:
-        return ("path", attachment_path)
+        try:
+            return ("path_bytes", _sha256_file(attachment_path))
+        except OSError as e:
+            return ("path_error", str(e))
     if attachment_b64 is not None:
         digest = hashlib.sha256(attachment_b64.encode("utf-8", "surrogatepass")).hexdigest()
         return ("b64", attachment_name, digest)
@@ -423,12 +465,13 @@ def idempotency_begin(key: str, identity):
 
     Returns a ("owner", entry) / ("wait", entry) / ("conflict", None) tuple.
     "owner" means this request is the first to use `key`: the caller runs
-    the real send and must call idempotency_finish(entry, ...) exactly once,
-    however it exits. "wait" means another request already owns `key` with
-    the SAME identity: the caller must idempotency_await(entry) and answer
-    with whatever that returns, and must NOT run its own send. "conflict"
-    means `key` is already bound to a DIFFERENT identity (chat_id, text, or
-    attachment): the caller must answer 409 and send nothing.
+    the real send and must call idempotency_finish(key, entry, ...) exactly
+    once, however it exits. "wait" means another request already owns `key`
+    with the SAME identity: the caller must idempotency_await(entry) and
+    answer with whatever that returns, and must NOT run its own send.
+    "conflict" means `key` is already bound to a DIFFERENT identity
+    (chat_id, text, or attachment): the caller must answer 409 and send
+    nothing.
     """
     now = time.monotonic()
     with _IDEMPOTENCY_LOCK:
@@ -449,15 +492,33 @@ def idempotency_begin(key: str, identity):
         return "wait", entry
 
 
-def idempotency_finish(entry, status: int, payload: dict) -> None:
+def idempotency_finish(key: str, entry, status: int, payload: dict) -> None:
     """Record this request's final outcome - the EXACT status and body a
     caller received, a 504 included - and release anyone waiting on it.
     Called by the owner exactly once, after the real send is fully decided,
-    never while holding _IDEMPOTENCY_LOCK (setting a threading.Event does
-    not need it)."""
+    never while holding _IDEMPOTENCY_LOCK for the set() itself (a
+    threading.Event does not need it).
+
+    A retry_safe outcome is NOT cached as this key's permanent answer
+    (Richard's review): retry_safe means nothing was sent, so if a pre-send
+    failure stayed in the map, every later retry with the same key would
+    just replay that SAME failure forever instead of ever actually trying
+    the send - exactly backwards from what retry_safe promises a caller.
+    Any request already waiting on this key still gets this exact outcome
+    (the event below already released it before the entry is dropped); the
+    NEXT request with this key, arriving after the drop, finds nothing and
+    becomes a fresh owner. A concurrent request already holds its own
+    reference to this entry object from idempotency_begin, independent of
+    whether the dict still maps the key to it, so in-flight protection for
+    that request is unaffected.
+    """
     entry["status"] = status
     entry["payload"] = payload
     entry["event"].set()
+    if payload.get("retry_safe") is True:
+        with _IDEMPOTENCY_LOCK:
+            if _IDEMPOTENCY_KEYS.get(key) is entry:
+                del _IDEMPOTENCY_KEYS[key]
 
 
 def idempotency_await(entry, timeout=None):
@@ -1956,7 +2017,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
         def respond(status, payload):
             if idem_entry is not None:
-                idempotency_finish(idem_entry, status, payload)
+                idempotency_finish(idem_key, idem_entry, status, payload)
             self.send_json(status, payload)
 
         # Staged bytes get deleted once osascript returns, success or failure.
