@@ -387,41 +387,45 @@ def attachment_identity(attachment_path, attachment_b64, attachment_name):
     (mc-vhnq7 review: the idempotency key binds to chat, exact text, AND
     attachment identity - not just chat and text).
 
-    attachment_path is fingerprinted by its CONTENT (sha256, read once here),
-    not the path string. Richard's review found the earlier path-string
-    version: he overwrote a temp image between two requests reusing the same
-    key, and the identities still compared equal, so the second request
-    replayed the first request's (now-stale) outcome for content that was no
-    longer there. Reading the file's current bytes closes exactly that gap -
-    two requests naming the same path with different content now get
-    different identities, so the second one is a conflict, not a replay.
+    attachment_path is fingerprinted by its CONTENT (sha256, read once
+    here), not the path string - Richard's review, third pass: comparing
+    the string let a file overwritten between two requests reusing the same
+    key replay the first request's stale outcome for content that was no
+    longer there.
 
-    This is NOT a full fix for every TOCTOU window: this bridge never
-    stages or copies an attachment_path file (README: "Nothing is copied and
-    nothing is deleted"), so nothing stops the file changing again between
-    this read and the osascript call that actually sends it moments later
-    under the chat lock. That remaining gap is narrow (no staging, network
-    call, or wait sits between the two for the request that OWNS the key -
-    only a request that must WAIT on another one skips reading the file at
-    all) and is an accepted, documented limitation of a host-local path,
-    the same way an identical manually-sent text is (see README). Closing it
-    completely would mean copying every attachment_path file into the
-    bridge's own staging area before hashing it, changing the "nothing is
-    copied" contract for ALL attachment_path sends, keyed or not - a bigger
-    change than this finding asked for.
+    CALLER CONTRACT (Richard's review, fifth pass): for a KEYED
+    attachment_path send, the caller must pass the path of an IMMUTABLE
+    staged COPY (stage_outbound_attachment_from_path's result), not the
+    original caller-supplied path - do_POST stages that copy, and sends it
+    too, before this function ever runs. Hashing the original path here
+    while a copy gets sent later (or vice versa) reopened exactly the gap
+    this exists to close: hold another send's chat lock, let a keyed path
+    send bind its identity to the original file's bytes while it waits for
+    that lock, overwrite the file, release the lock - the waiting request
+    answered 200 and sent the NEW bytes under the OLD hash, live-reproduced
+    against the real HTTP server. Reading an immutable snapshot removes the
+    gap entirely: nothing that happens to the original path after it was
+    copied can change what this function hashes or what osascript sends.
+    An UNKEYED attachment_path send never stages a copy or calls this
+    function at all - it is validated and sent directly from the original
+    path, unchanged ("nothing is copied and nothing is deleted", README).
 
-    An attachment_b64 upload has no such gap: it is identified by its bytes
-    and name, not by decoding and re-encoding - a sha256 of the base64 TEXT
-    the caller sent is already a content fingerprint, since equal base64
-    text decodes to equal bytes, and those bytes are what stage_outbound_
-    attachment later writes and send_message sends - the hashed bytes and
-    the sent bytes are provably the same because they both come from this
-    same request body.
+    An attachment_b64 upload has no such gap regardless: it is identified
+    by its bytes and name, not by decoding and re-encoding - a sha256 of
+    the base64 TEXT the caller sent is already a content fingerprint, since
+    equal base64 text decodes to equal bytes, and those bytes are what
+    stage_outbound_attachment later writes and send_message sends - the
+    hashed bytes and the sent bytes are provably the same because they both
+    come from this same request body. A non-string attachment_b64 (do_POST
+    reaches this function before stage_outbound_attachment's own type
+    check, when a key is present) gets its own distinct identity instead of
+    crashing on .encode() - do_POST's normal staging step rejects it
+    properly moments later, with its own 400 response.
 
-    A path that cannot be read at all (missing, permission denied, a
-    directory) gets its own distinct, deterministic identity built from the
-    error rather than raising here - do_POST's normal staging/validation
-    step rejects it properly moments later, with its own 400 response.
+    A path that cannot be read at all gets its own distinct, deterministic
+    identity built from the error rather than raising here - should not
+    normally happen, since do_POST validates and stages attachment_path
+    before this runs, but kept as a defensive fallback rather than a crash.
 
     None (no attachment) is itself a valid, comparable identity.
     """
@@ -431,6 +435,8 @@ def attachment_identity(attachment_path, attachment_b64, attachment_name):
         except OSError as e:
             return ("path_error", str(e))
     if attachment_b64 is not None:
+        if not isinstance(attachment_b64, str):
+            return ("b64_error", "attachment_b64 must be a string")
         digest = hashlib.sha256(attachment_b64.encode("utf-8", "surrogatepass")).hexdigest()
         return ("b64", attachment_name, digest)
     return None
@@ -697,6 +703,52 @@ def stage_outbound_attachment(b64_data: str, name: str) -> str:
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(raw)
+    except OSError:
+        discard_staged_attachment(staged)
+        raise
+    return staged
+
+
+def stage_outbound_attachment_from_path(path: str) -> str:
+    """Copy a caller-supplied attachment_path file into OUTBOX_DIR as an
+    immutable snapshot, for a KEYED send only (mc-vhnq7, Richard's review,
+    fifth pass).
+
+    For an idempotency-keyed attachment_path send, the bytes the key is
+    bound to and the bytes osascript actually sends must be the SAME read -
+    not the mutable original path read twice, once to fingerprint it and
+    again moments later to send it. Richard reproduced that gap live
+    against the real HTTP server: hold another send's chat lock, let a
+    keyed path send bind its identity to the file's original bytes while
+    it waits for that lock, overwrite the file, release the lock - the
+    waiting request still answered 200 and sent the NEW bytes under the
+    OLD hash. Copying the file here, before anything about it is hashed,
+    closes that: do_POST hashes and sends THIS copy, which nothing but the
+    bridge itself can touch again.
+
+    Runs validate_outbound_attachment's checks first (absolute path, is a
+    regular file on this host, looks like an image, within
+    MAX_ATTACHMENT_BYTES, not empty) - a bad path is rejected with
+    AttachmentRejected before anything is staged, same as an unkeyed send
+    gets today. Uses the SAME outbox directory, naming scheme, 0600
+    permissions, and size cap as stage_outbound_attachment (the
+    attachment_b64 path) - the caller owns deleting the result, exactly
+    like that function's.
+
+    An UNKEYED attachment_path send never calls this: it is validated only
+    and sent directly from the original path, unchanged ("nothing is
+    copied and nothing is deleted", README).
+    """
+    validate_outbound_attachment(path)
+    ensure_private_outbox_dir(OUTBOX_DIR)
+
+    name = os.path.basename(path) or "attachment"
+    staged = os.path.join(OUTBOX_DIR, "%s-%s" % (uuid.uuid4().hex, name))
+    fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as out, open(path, "rb") as src:
+            for chunk in iter(lambda: src.read(1 << 20), b""):
+                out.write(chunk)
     except OSError:
         discard_staged_attachment(staged)
         raise
@@ -1952,16 +2004,70 @@ class BridgeHandler(BaseHTTPRequestHandler):
             )
             return
 
-        # mc-vhnq7 (Richard's review): from here on, chat_id/text/attachment
-        # are all known, so an idempotency key can be checked against them.
-        # Everything BEFORE this point (missing/malformed fields) is not
-        # tracked - there is no "send" yet to deduplicate, and a caller can
-        # already safely retry those (retry_safe: true above) without a key.
-        idem_entry = None
         idem_key = self.headers.get(IDEMPOTENCY_HEADER)
+
+        # mc-vhnq7 (Richard's review, fifth pass): attachment_path's type is
+        # checked, and - only when a key is present - the file is validated
+        # and staged into an immutable snapshot, BEFORE anything about it is
+        # hashed for the idempotency key below. Two defects this closes:
+        #   1. attachment_identity() used to run first, so a malformed
+        #      attachment_path (a list, an int) reached os.path.isabs() /
+        #      open() as that raw value - an uncaught TypeError (500, no
+        #      retry_safe) instead of the usual 400.
+        #   2. Hashing the ORIGINAL path, then separately validating and
+        #      sending it later, left a real window between the two:
+        #      Richard reproduced it live against the real HTTP server -
+        #      hold another send's chat lock, let a keyed path send bind
+        #      its identity to the file's original bytes while it waits for
+        #      that lock, overwrite the file, release the lock - the
+        #      waiting request still answered 200 and sent the NEW bytes
+        #      under the OLD hash. Staging an immutable copy before hashing
+        #      means the bytes hashed and the bytes sent are provably the
+        #      same file - nothing that happens to the original path after
+        #      this point can change what gets sent.
+        # Unkeyed attachment_path behavior is unchanged: validated only,
+        # then sent directly from the original path - "nothing is copied
+        # and nothing is deleted" (README). attachment_b64 is unaffected by
+        # any of this and is still staged below, after the idempotency
+        # check: its identity is the base64 TEXT in this request's own
+        # body, which cannot change after the fact, so there is nothing to
+        # gain by staging it earlier.
+        staged_path = None
+        try:
+            if attachment_path is not None:
+                if not isinstance(attachment_path, str):
+                    raise AttachmentRejected("Field 'attachment_path' must be a string")
+                if idem_key:
+                    staged_path = stage_outbound_attachment_from_path(attachment_path)
+                    send_path = staged_path
+                else:
+                    send_path = validate_outbound_attachment(attachment_path)
+            else:
+                send_path = None
+        except AttachmentRejected as e:
+            self.send_error_json(400, str(e), retry_safe=True)
+            return
+        except (OSError, RuntimeError) as e:
+            log.error("staging attachment failed chat=%s: %s", chat_id, e)
+            discard_staged_attachment(staged_path)
+            self.send_error_json(500, "Cannot stage attachment", retry_safe=True)
+            return
+
+        # mc-vhnq7 (Richard's review): from here on, chat_id/text/attachment
+        # are all known - and, for a keyed attachment_path, already staged
+        # into an immutable snapshot above - so an idempotency key can be
+        # checked against them. Everything BEFORE this point (missing or
+        # malformed fields, a bad attachment_path) is not tracked - there
+        # is no "send" yet to deduplicate, and a caller can already safely
+        # retry those (retry_safe: true above) without a key.
+        idem_entry = None
         if idem_key:
+            # The staged COPY, not the original attachment_path, is what
+            # gets hashed and bound to the key - see attachment_identity's
+            # "CALLER CONTRACT" and stage_outbound_attachment_from_path.
+            identity_path = send_path if attachment_path is not None else None
             identity = (chat_id, text, attachment_identity(
-                attachment_path, attachment_b64, attachment_name,
+                identity_path, attachment_b64, attachment_name,
             ))
             role, entry = idempotency_begin(idem_key, identity)
             if role == "conflict":
@@ -1969,6 +2075,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 # Refused outright: nothing is sent, and this is never
                 # retried by a caller that honors retry_safe (there is none
                 # here, which already means "do not retry").
+                discard_staged_attachment(staged_path)
                 log.warning(
                     "idempotency CONFLICT key=%s chat=%s - key already bound "
                     "to a different chat/text/attachment",
@@ -1981,6 +2088,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 })
                 return
             if role == "wait":
+                # Another request already owns this key - any snapshot
+                # staged above is this request's own, unused copy, never
+                # referenced by the owner's outcome. Discard it regardless
+                # of how the wait resolves.
+                discard_staged_attachment(staged_path)
                 outcome = idempotency_await(entry)
                 if outcome is None:
                     # The owner is still working after our own wait budget.
@@ -2020,20 +2132,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 idempotency_finish(idem_key, idem_entry, status, payload)
             self.send_json(status, payload)
 
-        # Staged bytes get deleted once osascript returns, success or failure.
-        staged_path = None
+        # Staged bytes get deleted once osascript returns, success or
+        # failure. A keyed attachment_path's staged_path/send_path were
+        # already set above; only attachment_b64 still has staging to do.
         try:
             if attachment_b64 is not None:
                 staged_path = stage_outbound_attachment(
                     attachment_b64, attachment_name
                 )
                 send_path = staged_path
-            elif attachment_path is not None:
-                if not isinstance(attachment_path, str):
-                    raise AttachmentRejected("Field 'attachment_path' must be a string")
-                send_path = validate_outbound_attachment(attachment_path)
-            else:
-                send_path = None
         except AttachmentRejected as e:
             respond(400, {"error": str(e), "retry_safe": True})
             return

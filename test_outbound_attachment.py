@@ -1297,6 +1297,185 @@ class SendRouteTest(unittest.TestCase):
         self.assertEqual(body2["status"], "idempotency_conflict")
         self.assertEqual(len(self.sends), 1, "the changed-content request must never reach osascript")
 
+    def test_mutating_the_original_path_while_waiting_for_the_chat_lock_sends_the_original_bytes(self):
+        # Richard's LIVE repro against the real HTTP server: hold chat-x's
+        # send lock (a parked first request), start a keyed attachment_path
+        # send to the SAME chat ("owner") so it must wait for that lock
+        # AFTER already staging and hashing its file, let a genuinely
+        # concurrent SAME-KEY retry also stage+bind to the SAME (still
+        # original) bytes and become a waiter, THEN overwrite the original
+        # file, THEN release the lock. Staging before hashing (this fix)
+        # means both requests already hold an immutable snapshot of the
+        # ORIGINAL bytes (A) before the mutation happens: the send must use
+        # A, never whatever the mutated original holds by the time
+        # osascript actually runs, and the waiting retry must replay THAT
+        # exact outcome rather than running its own send.
+        parked = threading.Event()
+        release = threading.Event()
+
+        def parking_wait(db_path, chat_id, sent_after_unix_ms, *a, **k):
+            parked.set()
+            self.assertTrue(release.wait(10), "test released nothing")
+            return dict(self.wait_result)
+
+        bridge.wait_for_attachment_transfer = parking_wait
+
+        content_a = PNG_BYTES
+        content_b = PNG_BYTES + b"\x00\x00\x00\x00"
+        with open(self.png, "wb") as f:
+            f.write(content_a)
+
+        captured = {}
+        orig_fake_send = bridge.send_message
+
+        def capturing_send(chat_id, text, attachment_path=None):
+            if attachment_path and os.path.basename(attachment_path).endswith("-pic.png"):
+                with open(attachment_path, "rb") as f:
+                    captured["bytes_sent"] = f.read()
+            return orig_fake_send(chat_id, text, attachment_path)
+
+        bridge.send_message = capturing_send
+
+        staged_count = {"n": 0}
+        slock = threading.Lock()
+        orig_stage_from_path = bridge.stage_outbound_attachment_from_path
+
+        def counting_stage_from_path(path):
+            result = orig_stage_from_path(path)
+            with slock:
+                staged_count["n"] += 1
+            return result
+
+        bridge.stage_outbound_attachment_from_path = counting_stage_from_path
+
+        results = {}
+
+        def post_first():
+            # Holds the chat-x lock by parking inside the confirmation wait.
+            results["first"] = self._post(self._b64_payload(text=""))
+
+        def post_owner():
+            results["owner"] = self._post(
+                {"chat_id": "chat-x", "text": "x", "attachment_path": self.png},
+                idempotency_key="k-toctou", timeout=15,
+            )
+
+        def post_retry():
+            results["retry"] = self._post(
+                {"chat_id": "chat-x", "text": "x", "attachment_path": self.png},
+                idempotency_key="k-toctou", timeout=15,
+            )
+
+        try:
+            first = threading.Thread(target=post_first)
+            first.start()
+            self.assertTrue(parked.wait(5), "first request never reached its wait")
+
+            owner = threading.Thread(target=post_owner)
+            owner.start()
+            self.assertTrue(
+                self._wait_until(lambda: "k-toctou" in bridge._IDEMPOTENCY_KEYS, timeout=5),
+                "owner never registered the key before blocking on the chat lock",
+            )
+
+            # A genuinely concurrent retry, registered under the SAME key
+            # WHILE the original bytes are still in place - it stages its
+            # OWN snapshot (also hash A, since nothing has changed yet),
+            # finds the owner already registered, and becomes a waiter
+            # rather than a second owner or a conflict.
+            retry = threading.Thread(target=post_retry)
+            retry.start()
+            self.assertTrue(
+                self._wait_until(lambda: staged_count["n"] >= 2, timeout=5),
+                "the retry never finished staging its own (pre-mutation) snapshot",
+            )
+
+            # NOW mutate the original - after BOTH requests already bound
+            # their identity to the ORIGINAL bytes.
+            with open(self.png, "wb") as f:
+                f.write(content_b)
+
+            release.set()
+            first.join(10)
+            owner.join(10)
+            retry.join(10)
+        finally:
+            bridge.stage_outbound_attachment_from_path = orig_stage_from_path
+
+        self.assertEqual(results["first"][0], 200)
+        status_owner, body_owner = results["owner"]
+        status_retry, body_retry = results["retry"]
+        self.assertEqual(status_owner, 200)
+        self.assertEqual(status_retry, 200)
+        self.assertEqual(body_owner, body_retry)
+        self.assertEqual(
+            captured.get("bytes_sent"), content_a,
+            "osascript must send the snapshot's ORIGINAL bytes, not the mutated ones",
+        )
+        self.assertEqual(
+            len(self.sends), 2,
+            "exactly one send for 'first' and one for 'owner' - the retry (a waiter) must never call osascript",
+        )
+
+    def test_malformed_attachment_path_types_with_a_key_are_400_retry_safe_not_a_crash(self):
+        # Richard's review: attachment_identity() used to hash
+        # attachment_path before its type was checked, so a non-string
+        # value (a list, an int) reached os.path.isabs()/open() directly -
+        # an uncaught TypeError (a bare 500, no retry_safe) instead of the
+        # bridge's own "must be a string" 400.
+        for bad_path, label in [([], "list"), (123, "int")]:
+            status, body = self._post(
+                {"chat_id": "chat-x", "text": "x", "attachment_path": bad_path},
+                idempotency_key="k-malformed-%s" % label,
+            )
+            self.assertEqual(status, 400, label)
+            self.assertIn("must be a string", body["error"], label)
+            self.assertTrue(body["retry_safe"], label)
+        self.assertEqual(self.sends, [])
+
+    def test_missing_file_attachment_path_with_a_key_is_400_retry_safe(self):
+        missing = os.path.join(self.tmp, "does-not-exist.png")
+        status, body = self._post(
+            {"chat_id": "chat-x", "text": "x", "attachment_path": missing},
+            idempotency_key="k-missing-file",
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("not a file", body["error"])
+        self.assertTrue(body["retry_safe"])
+        self.assertEqual(self.sends, [])
+
+    def test_directory_attachment_path_with_a_key_is_400_retry_safe(self):
+        a_dir = os.path.join(self.tmp, "a-directory")
+        os.makedirs(a_dir, exist_ok=True)
+        status, body = self._post(
+            {"chat_id": "chat-x", "text": "x", "attachment_path": a_dir},
+            idempotency_key="k-directory",
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("not a file", body["error"])
+        self.assertTrue(body["retry_safe"])
+        self.assertEqual(self.sends, [])
+
+    def test_malformed_attachment_path_without_a_key_is_still_a_400(self):
+        # Scope check: the type check moved earlier for everyone (keyed or
+        # not), but the outcome for an unkeyed request is unchanged.
+        status, body = self._post({"chat_id": "chat-x", "text": "x", "attachment_path": []})
+        self.assertEqual(status, 400)
+        self.assertIn("must be a string", body["error"])
+        self.assertTrue(body["retry_safe"])
+
+    def test_malformed_attachment_b64_type_with_a_key_is_400_not_a_crash(self):
+        # Same root cause, the b64 side: attachment_identity() used to call
+        # .encode() on attachment_b64 before stage_outbound_attachment's own
+        # type check ever ran, when a key is present.
+        status, body = self._post(
+            {"chat_id": "chat-x", "text": "x", "attachment_b64": 12345, "attachment_name": "a.png"},
+            idempotency_key="k-malformed-b64",
+        )
+        self.assertEqual(status, 400)
+        self.assertTrue(body["retry_safe"])
+        self.assertEqual(self.sends, [])
+
     def test_retry_safe_pre_send_failure_is_not_cached_a_same_key_retry_then_sends(self):
         # Blocker (Richard's review): a 502 retry_safe:true (nothing sent)
         # used to be cached under the key like any other outcome, so a
